@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<input id="name" value="Volt">
+<button id="go">go</button>
+<span id="out"></span>
+<button id="inner">inner</button>
+<button id="peter">peter</button>
+<script>
+const trace = [];
+// Synchronous page->native call. While blocked, the native side may ask the
+// page to do things; we do them and keep waiting, so calls can nest.
+function native(name, ...args) {
+  let msg = { type: 'call', name, args };
+  trace.push('js call ' + name);
+  for (;;) {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/bridge', false);            // false = synchronous
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.send(JSON.stringify(msg));
+    const reply = JSON.parse(xhr.responseText);
+    if (reply.type === 'return') { trace.push('js back ' + name); return reply.value; }
+    msg = { type: 'result', value: perform(reply.op) };
+  }
+}
+function perform(op) {
+  const el = document.getElementById(op.id);
+  if (op.op === 'global') return window[op.name];
+  if (op.op === 'get') return el[op.prop];
+  if (op.op === 'set') { el[op.prop] = op.value; return null; }
+  if (op.op === 'click') { el.click(); return window.innerResult; }   // listeners run synchronously
+}
+document.getElementById('inner').addEventListener('click', () => {
+  window.innerResult = native('onInner');
+});
+window.peter_pan = true;
+document.getElementById('peter').addEventListener('click', () => {
+  window.peterResult = native('onPeter', window.peterDelay || 0);
+});
+document.getElementById('go').addEventListener('click', () => {
+  window.result = native('onClick');
+  window.trace = trace;
+});
+</script>
