@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "description": "Test tooling for volt2. The library itself is the single header volt2.hpp.",
+  "scripts": {
+    "test": "bash tests/run.sh"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}
