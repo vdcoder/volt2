@@ -85,12 +85,26 @@ public:
             heldFunctions.clear();
         });
 
+        // Temporaries passed straight into call and set stay alive until the page has used them.
+        expose(rvalueArguments, "rvalueArguments", [this] {
+            document["body"].call("appendChild", document.call("createElement", "div"));
+            Value holder = Value::object();
+            holder.set("child", document.call("createElement", "span"));
+            return holder["child"]["tagName"].as<std::string>();
+        });
+
+        // A fresh object returned in the same call as a leak warning (development) reaches the page.
+        expose(freshAfterGrowth, "freshAfterGrowth", [this](const Value& count) {
+            for (int i = 0, n = count.as<int>(); i < n; ++i) heldValues.push_back(document.call("createElement", "span"));
+            return document.call("createElement", "b");  // C++ holds nothing of it once returned
+        });
+
         // Values belong to the thread that called volt2::run.
         expose(fromThread, "fromThread", [this] {
 #ifdef __EMSCRIPTEN__
             return std::string("no threads in this build");
 #else
-            std::string message = "no error";
+            std::string message = "no error", statsMessage = "no error";
             Value copy = document;
             std::thread([&] {
                 try {
@@ -98,11 +112,34 @@ public:
                 } catch (const volt2::js::Error& e) {
                     message = e.what();
                 }
+                try {
+                    (void)volt2::stats();
+                } catch (const volt2::js::Error& e) {
+                    statsMessage = e.what();
+                }
             }).join();
-            // Destroying the last copy of a Value on another thread must not corrupt anything.
+            // The last copy of a Value destroyed on another thread is released safely.
             Value head = document["head"];
             std::thread([moved = std::move(head)]() mutable { Value gone = std::move(moved); }).join();
-            return message;
+            return message + " | " + statsMessage;
+#endif
+        });
+
+        // A js::Function destroyed on another thread, together with what its lambda points at:
+        // JavaScript must get "released", never a call into freed memory.
+        expose(dropFunctionOnThread, "dropFunctionOnThread", [this] {
+#ifdef __EMSCRIPTEN__
+            return false;
+#else
+            struct Holder {
+                int value = 42;
+                Function fn;
+            };
+            auto holder = std::make_unique<Holder>();
+            holder->fn = volt2::js::function([data = holder.get()] { return data->value; });
+            window.set("droppedOnThread", holder->fn);
+            std::thread([moved = std::move(holder)]() mutable { moved.reset(); }).join();
+            return true;
 #endif
         });
     }
@@ -119,7 +156,8 @@ private:
     Value first, second;
     std::vector<Value> heldValues;
     std::vector<Function> heldFunctions;
-    Function stats, churn, holdTwice, keyed, releasedFunction, holdMany, dropAll, fromThread;
+    Function stats, churn, holdTwice, keyed, releasedFunction, holdMany, dropAll, rvalueArguments, freshAfterGrowth,
+        fromThread, dropFunctionOnThread;
 };
 
 }  // namespace

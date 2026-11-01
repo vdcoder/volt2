@@ -48,6 +48,13 @@ function check(condition, message) {
     check((await call(() => window.releasedFunction())) === 'still here', 'a held js::Function can be called');
     const released = await call(() => { try { window.temporary(); return 'no error'; } catch (e) { return e.message; } });
     check(/was released/.test(released), `after release, calling it throws: "${released}"`);
+    const beforeStale = await call(() => volt2.handleCount());
+    await call(() => { for (let i = 0; i < 20; i++) { try { window.temporary(document.createElement('i')); } catch (e) {} } });
+    const afterStale = await call(() => volt2.handleCount());
+    check(afterStale === beforeStale, `calling a released function with objects leaks nothing: ${beforeStale} -> ${afterStale} handles`);
+
+    const tag = await call(() => { try { return window.rvalueArguments(); } catch (e) { return e.message; } });
+    check(tag === 'SPAN', `temporaries passed straight into call and set work: "${tag}"`);
 
     await call(() => window.holdMany(250));
     const many = await counts();
@@ -62,9 +69,20 @@ function check(condition, message) {
     const dropped = await counts();
     check(same(dropped, held), `dropping them returns to before (${show(dropped)})`);
 
+    const fresh = await call(() => { try { return window.freshAfterGrowth(900).tagName; } catch (e) { return e.message; } });
+    check(fresh === 'B', `a fresh object returned while a leak warning fires still arrives: "${fresh}"`);
+    await call(() => window.dropAll());
+
+    const beforeThread = await counts();
     const thread = await call(() => window.fromThread());
     if (mode === 'development') {
-      check(/only be used on the thread that called volt2::run/.test(thread), `another thread is refused: "${thread}"`);
+      check(/^[^|]*only be used on the thread that called volt2::run/.test(thread), `another thread is refused: "${thread.split(' | ')[0]}"`);
+      check(/\|.*only be used on the thread that called volt2::run/.test(thread), `stats() on another thread is refused: "${thread.split(' | ')[1]}"`);
+      const afterThread = await counts();
+      check(same(afterThread, beforeThread), `a Value destroyed on another thread is still released (${show(beforeThread)} -> ${show(afterThread)})`);
+      check((await call(() => window.dropFunctionOnThread())) === true, 'a js::Function was destroyed on another thread');
+      const result = await call(() => { try { return window.droppedOnThread(); } catch (e) { return e.message; } });
+      check(/was released/.test(String(result)), `...and JavaScript is told it was released: "${result}"`);
     } else {
       check(thread === 'no threads in this build', 'WebAssembly build has no threads');
     }

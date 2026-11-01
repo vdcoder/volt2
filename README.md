@@ -104,9 +104,10 @@ no parameters, returning `void` or anything that can be passed to JavaScript.
   name, from a variable that lives long enough, typically a member of the object that uses it.
   Passing a temporary, such as `call("addEventListener", "click", volt2::js::function(...))`, is a
   compile error, because it would be released when the statement ends.
-- **Threads.** Values and functions belong to the thread that called `volt2::run`; using one on
-  another thread throws a `js::Error`. One destroyed on another thread keeps its page object until
-  the page reloads (with a one-time warning) instead of corrupting anything.
+- **Threads.** Values, functions and `volt2::stats()` belong to the thread that called `volt2::run`;
+  using them on another thread throws a `js::Error`. Destroying one on another thread is safe: the
+  release is queued and applied on volt2's thread before its next operation or call, so a released
+  function can never be called again.
 - **Leaks.** `volt2::stats()` reports how many page objects and functions C++ holds. While developing,
   volt2 warns in your console and the browser console when either passes 10,000 (`VOLT2_WARN_AT`),
   then again each time the count doubles.

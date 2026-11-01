@@ -558,6 +558,13 @@ struct Runtime {
     std::size_t warnAt = 10000;  // development leak warnings, see VOLT2_WARN_AT
     std::size_t warnValuesAt = 10000;
     std::size_t warnFunctionsAt = 10000;
+
+    // Values and Functions destroyed on other threads: queued here (id, generation) and
+    // applied on volt2's thread before its next operation or call.
+    std::mutex elsewhereMutex;
+    std::atomic<bool> elsewherePending{false};
+    std::vector<std::pair<long long, unsigned long long>> releasedElsewhere;
+    std::vector<std::pair<long long, unsigned long long>> functionsDroppedElsewhere;
 };
 
 // Never destroyed, so Values that outlive main cannot touch a dead runtime.
@@ -579,26 +586,47 @@ inline void requireVoltThread() {
     }
 }
 
-// A Value or Function destroyed on another thread: leave the runtime alone (it is not
-// thread-safe); the page keeps the object until it reloads.
-inline void droppedOnOtherThread() {
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true)) {
-        logError("a js::Value or js::Function was destroyed on another thread. Its JavaScript object stays "
-                 "alive until the page reloads. Use them only on the thread that called volt2::run.");
+// The runtime is not thread-safe, so a Value or Function destroyed on another thread only
+// queues its release; volt2's thread applies it (see settleElsewhere).
+inline void queueElsewhere(std::vector<std::pair<long long, unsigned long long>> Runtime::*queue, long long id,
+                           unsigned long long generation) {
+    Runtime& r = runtime();
+    {
+        std::lock_guard<std::mutex> lock(r.elsewhereMutex);
+        (r.*queue).emplace_back(id, generation);
     }
+    r.elsewherePending.store(true, std::memory_order_release);
 }
 
-inline Handle::~Handle() {
+inline void releaseHandle(long long id, unsigned long long generation) {
     Runtime& r = runtime();
-    if (!onVoltThread()) {
-        droppedOnOtherThread();
-        return;
-    }
     if (generation != r.generation) return;  // that page is gone, and its table with it
     r.releases.push_back(id);
     auto slot = r.live.find(id);
     if (slot != r.live.end() && slot->second.expired()) r.live.erase(slot);
+}
+
+inline Handle::~Handle() {
+    if (onVoltThread()) releaseHandle(id, generation);
+    else queueElsewhere(&Runtime::releasedElsewhere, id, generation);
+}
+
+// On volt2's thread: apply releases queued by other threads. Functions first, so a
+// function destroyed elsewhere can never be called again, even if its lambda pointed
+// at memory that is gone now.
+inline void settleElsewhere() {
+    Runtime& r = runtime();
+    if (!r.elsewherePending.exchange(false, std::memory_order_acquire)) return;
+    std::vector<std::pair<long long, unsigned long long>> handles, functions;
+    {
+        std::lock_guard<std::mutex> lock(r.elsewhereMutex);
+        handles.swap(r.releasedElsewhere);
+        functions.swap(r.functionsDroppedElsewhere);
+    }
+    for (auto [id, generation] : functions) {
+        if (generation == r.generation) r.callbacks.erase(id);
+    }
+    for (auto [id, generation] : handles) releaseHandle(id, generation);
 }
 
 // The Handle for a page object, shared by every Value that refers to it.
@@ -634,6 +662,7 @@ inline Json request(Json op) {
     Runtime& r = runtime();
     if (!r.transport) throw js::Error("volt2: no page is connected. JavaScript is only reachable inside volt2::run.");
     requireVoltThread();
+    settleElsewhere();
     attachReleases(op);
     Json reply = r.transport->request(op);
     if (const Json* error = reply.find("error")) throw js::Error(error->asString());
@@ -696,7 +725,9 @@ template <js::ToJs T>
 js::Value toValue(T&& x) {
     using D = std::remove_cvref_t<T>;
     if constexpr (std::same_as<D, js::Value>) {
-        return std::forward<T>(x);
+        // A copy, never a move: a temporary argument must keep its handle alive until the
+        // operation using it has reached the page.
+        return js::Value(x);
     } else if constexpr (std::same_as<D, js::Function>) {
         static_assert(std::is_lvalue_reference_v<T>,
                       "volt2: pass a js::Function by name, from a variable that lives as long as JavaScript may "
@@ -772,18 +803,21 @@ inline void noticeGrowth() {
 // the page rethrows as a JavaScript Error in the caller, so nothing unwinds across the bridge.
 inline Json serveCall(const Json& message) {
     Runtime& r = runtime();
+    settleElsewhere();  // before the lookup: a function destroyed elsewhere must not run
     Json reply = returnReply();
     try {
-        const Json* id = message.find("id");
-        auto it = id ? r.callbacks.find(static_cast<long long>(id->asNumber())) : r.callbacks.end();
-        if (it == r.callbacks.end()) throw js::Error("volt2: this C++ function was released (its js::Function is gone)");
-        std::shared_ptr<Callback> callback = it->second;  // keeps it alive if the table changes
+        // Arguments first: they hold page objects that must be released even if the call fails.
         js::Args args;
         if (const Json* list = message.find("a")) {
             for (const Json& wire : list->items()) args.push_back(fromWire(wire));
         }
-        reply.set("v", toWire((*callback)(args)));
-        noticeGrowth();
+        const Json* id = message.find("id");
+        auto it = id ? r.callbacks.find(static_cast<long long>(id->asNumber())) : r.callbacks.end();
+        if (it == r.callbacks.end()) throw js::Error("volt2: this C++ function was released (its js::Function is gone)");
+        std::shared_ptr<Callback> callback = it->second;  // keeps it alive if the table changes
+        js::Value result = (*callback)(args);
+        noticeGrowth();  // may talk to the page, so `result` must still hold its object
+        reply.set("v", toWire(result));
     } catch (const PageReplaced&) {
         throw;
     } catch (const std::exception& e) {
@@ -831,11 +865,17 @@ inline void beginPage() {
     r.releases.clear();
     r.live.clear();
     r.warnValuesAt = r.warnFunctionsAt = r.warnAt;
+    std::lock_guard<std::mutex> lock(r.elsewhereMutex);  // queued releases belong to the old page
+    r.releasedElsewhere.clear();
+    r.functionsDroppedElsewhere.clear();
 }
 
 }  // namespace detail
 
+// Only on the thread that called volt2::run.
 inline Stats stats() {
+    detail::requireVoltThread();
+    detail::settleElsewhere();
     detail::Runtime& r = detail::runtime();
     std::size_t values = 0;
     for (const auto& entry : r.live) values += entry.second.expired() ? 0 : 1;
@@ -955,11 +995,11 @@ inline const Value& Function::value() const {
 }
 
 inline Function::Owner::~Owner() {
-    detail::Runtime& r = detail::runtime();
     if (!detail::onVoltThread()) {
-        detail::droppedOnOtherThread();
+        detail::queueElsewhere(&detail::Runtime::functionsDroppedElsewhere, id, generation);
         return;
     }
+    detail::Runtime& r = detail::runtime();
     if (generation == r.generation) r.callbacks.erase(id);
 }
 
