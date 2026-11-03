@@ -16,7 +16,7 @@ using volt2::js::Value;
 
 namespace {
 
-class LifetimePage {
+class LifetimePage : public volt2::Session {
 public:
     LifetimePage() {
         expose(stats, "cppStats", [] {
@@ -162,9 +162,4 @@ private:
 
 }  // namespace
 
-void site(volt2::Session&) {
-    static std::unique_ptr<LifetimePage> page;
-    page = std::make_unique<LifetimePage>();
-}
-
-int main() { return volt2::run(site); }
+int main() { return volt2::run<LifetimePage>(); }

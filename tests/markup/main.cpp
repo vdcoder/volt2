@@ -1,0 +1,87 @@
+// Test program for the markup language and rendering, driven by tests/markup.test.cjs.
+#include "volt2.hpp"
+
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using namespace volt2;
+
+struct Markup : Session {
+    static inline int constructed = 0;
+    static inline int destroyed = 0;
+    int renders = 0;
+    std::vector<std::string> log;
+    std::string typed;
+
+    Markup() { ++constructed; }
+    ~Markup() override {
+        ++destroyed;
+        // Runs after this session's page is gone (development): must not reach the new page.
+        Value::global("document").set("title", "set by a destroyed session");
+    }
+};
+
+std::string joined(const std::vector<std::string>& items) {
+    std::string out;
+    for (const std::string& item : items) out += (out.empty() ? "" : ",") + item;
+    return out;
+}
+
+VirtualNode site(Markup& s) {
+    ++s.renders;
+    return tag::Div[attr::Id = "root"](
+        tag::P[attr::Id = "lifecycle"]("constructed ", Markup::constructed, ", destroyed ", Markup::destroyed,
+                                       ", renders ", s.renders),
+
+        // Attribute values: strings, booleans (false leaves the attribute out), numbers, data- and aria-.
+        tag::Input[attr::Id = "box", attr::Type = "checkbox", attr::Checked = true, attr::Disabled = false,
+                   attr::TabIndex = 3, attr::Data("role") = "demo", attr::Aria("label") = "A box"](),
+
+        // Text is always text, never HTML.
+        tag::P[attr::Id = "text"]("<b>not bold</b> & \"quoted\""),
+        tag::P[attr::Id = "numbers"](42, " ", 2.5, " ", -0.125, " ", 1e21),
+
+        // Bubbling runs the target's handler, then its ancestors'; stopPropagation stops it.
+        tag::Div[attr::Id = "outer", event::OnClick([&s] { s.log.push_back("outer"); })](
+            tag::Button[attr::Id = "inner", event::OnClick([&s] { s.log.push_back("inner"); })]("inner"),
+            tag::Button[attr::Id = "stop", event::OnClick([&s](const Value& e) {
+                s.log.push_back("stop");
+                e.call("stopPropagation");
+            })]("stop")),
+        tag::P[attr::Id = "log"](joined(s.log)),
+
+        // preventDefault works mid-dispatch, so the form does not navigate.
+        tag::Form[attr::Id = "form", attr::Action = "/elsewhere", event::OnSubmit([&s](const Value& e) {
+            e.call("preventDefault");
+            s.log.push_back("submit");
+        })](tag::Button[attr::Id = "send", attr::Type = "submit"]("Send")),
+
+        // Event values: what was typed.
+        tag::Input[attr::Id = "name",
+                   event::OnInput([&s](const Value& e) { s.typed = e["target"]["value"].as<std::string>(); })](),
+        tag::P[attr::Id = "typed"]("typed: ", s.typed),
+
+        // Events that do not bubble reach only their target.
+        tag::Div[attr::Id = "wrap", event::OnFocus([&s] { s.log.push_back("wrap-focus"); })](
+            tag::Input[attr::Id = "focusme", event::OnFocus([&s] { s.log.push_back("focus"); })]()),
+
+        // Children: a range, optionals, and nothing.
+        tag::Ul[attr::Id = "list"](std::vector<VirtualNode>{tag::Li("a"), tag::Li("b")}, std::optional<VirtualNode>(),
+                                   std::optional<VirtualNode>(tag::Li("c")), VirtualNode()),
+
+        // A handler that throws: the page gets the error and still shows the new state.
+        tag::Button[attr::Id = "throw", event::OnClick([&s] {
+            s.log.push_back("throw");
+            throw std::runtime_error("handler failed");
+        })]("throw"),
+
+        // A handler that clicks another element: both run, and the page renders once.
+        tag::Button[attr::Id = "relay", event::OnClick([&s](const Value& e) {
+            s.log.push_back("relay");
+            e["target"]["ownerDocument"].call("getElementById", "inner").call("click");
+        })]("relay"));
+}
+
+int main() { return run(site); }

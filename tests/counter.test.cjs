@@ -1,28 +1,12 @@
-// Browser test for examples/counter, for either build.
+// Browser test for examples/counter (the markup starter), for either build.
 //   node tests/counter.test.cjs http://127.0.0.1:8080/
-// Needs Playwright (npm i playwright; npx playwright install chromium).
 const { chromium } = require('playwright');
 
 const url = process.argv[2];
-if (!url) {
-  console.error('usage: node tests/counter.test.cjs <url>');
-  process.exit(2);
-}
-
 let failures = 0;
 function check(condition, message) {
   console.log(`  ${condition ? 'ok  ' : 'FAIL'} ${message}`);
   if (!condition) failures++;
-}
-
-// Handlers re-render nothing yet, but give the page a moment anyway rather than racing it.
-async function settled(read, expected) {
-  let last;
-  for (const end = Date.now() + 5000; Date.now() < end; await new Promise((r) => setTimeout(r, 25))) {
-    last = await read();
-    if (expected instanceof RegExp ? expected.test(last) : last === expected) return last;
-  }
-  return last;
 }
 
 (async () => {
@@ -33,46 +17,38 @@ async function settled(read, expected) {
   page.on('console', (m) => {
     if (m.type() === 'error' || m.type() === 'warning') problems.push(`${m.type()}: ${m.text()}`);
   });
-  const text = (selector) => () => page.textContent(selector);
+  const text = (selector) => page.textContent(selector);
+  const fruits = () => page.$$eval('#fruits li', (items) => items.map((li) => li.firstChild.textContent));
 
   try {
     await page.goto(url);
-    await page.waitForSelector('#counter', { timeout: 15000 });
-    check((await page.title()) === 'volt2 counter', 'C++ set the page title');
+    await page.waitForSelector('#count', { timeout: 15000 });
+    check((await text('#count')) === 'Clicked 0 times', 'first render shows the count');
+    check((await fruits()).join(',') === 'Apple,Banana,Cherry', 'and the list from the session');
+    check((await page.$('#panel')) !== null && (await page.$('#warning')) === null, 'panel open, no warning yet');
 
-    for (let i = 0; i < 3; i++) await page.click('#counter');
-    check((await settled(text('#counter'), 'Clicked 3 times')) === 'Clicked 3 times', 'counter: C++ state survives between clicks');
+    for (let i = 0; i < 3; i++) await page.click('#increment');
+    await page.click('#decrement');
+    check((await text('#count')) === 'Clicked 2 times', 'clicks change session state and the page renders again');
 
-    await page.evaluate(() => { window.peter_pan = true; window.twice = (x) => x * 2; });
-    await page.click('#ask');
-    let answer = await settled(text('#answer'), 'peter_pan is true, twice(21) is 42');
-    check(answer === 'peter_pan is true, twice(21) is 42', `handler read a page global and called a page function: "${answer}"`);
-    await page.evaluate(() => { window.peter_pan = false; delete window.twice; });
-    await page.click('#ask');
-    answer = await settled(text('#answer'), 'peter_pan is false');
-    check(answer === 'peter_pan is false', `...and sees the page change: "${answer}"`);
+    for (let i = 0; i < 9; i++) await page.click('#increment');
+    check((await text('#count')) === 'Clicked 11 times' && (await page.$('#warning')) !== null, 'a conditional element appears past 10');
 
-    await page.click('#outer');
-    const log = await settled(text('#log'), 'outer-start;inner;outer-end');
-    check(log === 'outer-start;inner;outer-end', `nested call ran inside click(): "${log}"`);
+    await page.click('#toggle');
+    check((await page.$('#panel')) === null && (await text('#toggle')) === 'Show the panel', 'the panel closes');
+    await page.click('#toggle');
+    check((await page.$('#panel')) !== null && (await text('#toggle')) === 'Hide the panel', 'and opens again');
 
-    await page.click('#fail');
-    const errors = await settled(text('#errors'), /not a function/);
-    check(/^C\+\+ caught: TypeError: .*not a function/.test(errors), `JS error became a C++ exception: "${errors}"`);
-
-    const sum = await page.evaluate(() => window.cppAdd(2, 3.5));
-    check(sum === 5.5, `page JS called a C++ function: cppAdd(2, 3.5) = ${sum}`);
-    const thrown = await page.evaluate(() => { try { window.cppThrow(); return 'no error'; } catch (e) { return e.message; } });
-    check(thrown === 'thrown in C++', `C++ exception became a JS Error: "${thrown}"`);
-    const badArg = await page.evaluate(() => { try { return window.cppAdd('a', 1); } catch (e) { return e.message; } });
-    check(/expected a number, got string/.test(badArg), `bad argument type is reported: "${badArg}"`);
+    await page.click('#fruits li:nth-child(2) button');
+    check((await fruits()).join(',') === 'Apple,Cherry', 'a list item removes itself');
+    await page.click('#add');
+    await page.click('#add');
+    check((await fruits()).join(',') === 'Apple,Cherry,Fruit 1,Fruit 2', 'items are added');
 
     const before = await page.evaluate(() => volt2.handleCount());
-    await page.click('#stress');
-    await settled(text('#stress'), 'done');
-    for (let i = 0; i < 5; i++) await page.click('#counter');
+    for (let i = 0; i < 20; i++) await page.click('#increment');
     const after = await page.evaluate(() => volt2.handleCount());
-    check(after <= before + 2, `handles are released: ${before} before, ${after} after 300 reads and 5 clicks`);
+    check(after === before, `20 more renders hold no extra page objects (${before} -> ${after})`);
 
     check(problems.length === 0, `no page errors or console warnings${problems.length ? ': ' + problems.join(' | ') : ''}`);
   } catch (e) {

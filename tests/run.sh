@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Builds examples/counter every way this machine supports and runs the browser tests.
+# Builds the example and the test programs every way this machine supports and runs
+# the browser tests against each build.
 #
 #   tests/run.sh
 #
-# Needs: a C++20 compiler, Python 3, curl, Node with Playwright (npm i, then
+# Needs: a C++23 compiler, Python 3, curl, Node with Playwright (npm i, then
 # npx playwright install chromium). Used when present: clang++, em++ (Emscripten,
 # activated), x86_64-w64-mingw32-g++-posix and wine (runs the Windows build).
 set -uo pipefail
@@ -12,9 +13,14 @@ export NODE_PATH="${NODE_PATH:-$(npm root -g 2>/dev/null)}"
 
 OUT=build/tests
 rm -rf "$OUT" && mkdir -p "$OUT"
-FLAGS=(-std=c++20 -Wall -Wextra -Wpedantic -Werror -g -I.)
-COUNTER=examples/counter/main.cpp
-LIFETIME=tests/lifetime/main.cpp
+FLAGS=(-std=c++23 -Wall -Wextra -Wpedantic -Werror -g -I.)
+# name, source, tests on development builds, tests on WebAssembly builds
+PROGRAMS=(
+    "counter examples/counter/main.cpp counter counter"
+    "markup tests/markup/main.cpp markup markup"
+    "bridge tests/bridge/main.cpp bridge,reload bridge"
+    "lifetime tests/lifetime/main.cpp lifetime lifetime"
+)
 port=8900
 failed=()
 
@@ -30,9 +36,29 @@ wait_for() {
     return 1
 }
 
+build() {  # log name, compiler and arguments
+    local name=$1; shift
+    if ! "$@" > "$OUT/$name.build.log" 2>&1; then
+        cat "$OUT/$name.build.log"
+        fail "$name: build"
+        return 1
+    fi
+}
+
+# Builds every program: build_all <toolchain> <suffix> <compiler> <flags and libraries...>
+# The source comes right after the compiler, so libraries such as -lws2_32 follow it.
+build_all() {
+    local name=$1 suffix=$2 compiler=$3; shift 3
+    local status=0 program source
+    for entry in "${PROGRAMS[@]}"; do
+        read -r program source _ _ <<< "$entry"
+        build "$name-$program" "$compiler" "$source" "$@" -o "$OUT/$program-$name$suffix" || status=1
+    done
+    return $status
+}
+
 # Starts a development build and runs the given browser tests against it.
-#   run_dev <log name> "<test> <test>..." <command...>
-run_dev() {
+run_dev() {  # log name, "test test...", command...
     local name=$1 tests=$2; shift 2
     port=$((port + 1))
     local url="http://127.0.0.1:$port/"
@@ -47,45 +73,41 @@ run_dev() {
     wait "$pid" 2> /dev/null
 }
 
-# Both programs of a development build: the counter example and the lifetime test.
-test_native() {  # name, command prefix (empty, or wine)
-    local name=$1 prefix=$2 suffix=${3:-}
-    run_dev "$name-counter" "counter reload" $prefix "$OUT/counter-$name$suffix"
-    run_dev "$name-lifetime" "lifetime" $prefix "$OUT/lifetime-$name$suffix"
-}
-
-# Builds both programs: build_both <name> <suffix> <compiler> <flags and libraries...>
-# The source comes right after the compiler, so libraries such as -lws2_32 follow it.
-build_both() {
-    local name=$1 suffix=$2 compiler=$3; shift 3
-    build "$name-counter" "$compiler" "$COUNTER" "$@" -o "$OUT/counter-$name$suffix" &&
-        build "$name-lifetime" "$compiler" "$LIFETIME" "$@" -o "$OUT/lifetime-$name$suffix"
-}
-
-build() {  # name, compiler and arguments
-    local name=$1; shift
-    if ! "$@" > "$OUT/$name.build.log" 2>&1; then
-        cat "$OUT/$name.build.log"
-        fail "$name: build"
-        return 1
-    fi
+test_native() {  # toolchain, command prefix (empty, or wine), executable suffix
+    local name=$1 prefix=$2 suffix=${3:-} program tests
+    for entry in "${PROGRAMS[@]}"; do
+        read -r program _ tests _ <<< "$entry"
+        run_dev "$name-$program" "${tests//,/ }" $prefix "$OUT/$program-$name$suffix"
+    done
 }
 
 step "embedded page client is up to date"
 python3 tools/embed_js.py --check || fail "embed check"
 
-step "g++ (C++20; C++23 compile check)"
-build gcc-c++23 g++ "${FLAGS[@]}" -std=c++23 -fsyntax-only "$LIFETIME"
-build_both gcc "" g++ "${FLAGS[@]}" -O1 -pthread && test_native gcc ""
+step "C++20 is refused with a clear message"
+if g++ -std=c++20 -fsyntax-only -I. examples/counter/main.cpp 2> "$OUT/cxx20.log"; then
+    fail "a C++20 build was accepted"
+elif grep -q 'volt2 needs C++23' "$OUT/cxx20.log"; then
+    echo "  ok: $(grep -m1 -o 'volt2 needs C++23[^"]*' "$OUT/cxx20.log")"
+else
+    head -5 "$OUT/cxx20.log"
+    fail "C++20 error message"
+fi
+
+step "the README's example compiles"
+awk '/^```cpp$/{n++; if (n == 1) {f = 1; next}} f && /^```$/{exit} f' README.md > "$OUT/readme.cpp"
+build readme g++ "${FLAGS[@]}" -fsyntax-only "$OUT/readme.cpp" && echo "  ok"
+
+step "g++"
+build_all gcc "" g++ "${FLAGS[@]}" -O1 -pthread && test_native gcc ""
 
 if have clang++; then
-    step "clang++ (C++20; C++23 compile check)"
-    build clang-c++23 clang++ "${FLAGS[@]}" -std=c++23 -fsyntax-only "$LIFETIME"
-    build_both clang "" clang++ "${FLAGS[@]}" -O1 -pthread && test_native clang ""
+    step "clang++"
+    build_all clang "" clang++ "${FLAGS[@]}" -O1 -pthread && test_native clang ""
 fi
 
 step "ThreadSanitizer (the bridge hands messages between threads)"
-if build_both tsan "" g++ "${FLAGS[@]}" -O1 -fsanitize=thread -pthread; then
+if build_all tsan "" g++ "${FLAGS[@]}" -O1 -fsanitize=thread -pthread; then
     TSAN_OPTIONS="halt_on_error=0" test_native tsan ""
     races=$(cat "$OUT"/tsan-*.log | grep -c 'WARNING: ThreadSanitizer')
     echo "  data races reported: $races"
@@ -93,26 +115,26 @@ if build_both tsan "" g++ "${FLAGS[@]}" -O1 -fsanitize=thread -pthread; then
 fi
 
 step "AddressSanitizer + UndefinedBehaviorSanitizer"
-if build_both asan "" g++ "${FLAGS[@]}" -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -pthread; then
+if build_all asan "" g++ "${FLAGS[@]}" -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -pthread; then
     ASAN_OPTIONS="detect_leaks=0" test_native asan ""
     reports=$(cat "$OUT"/asan-*.log | grep -c -E 'ERROR: AddressSanitizer|runtime error:')
     echo "  sanitizer reports: $reports"
     [ "$reports" = 0 ] || fail "asan: $reports reports in $OUT/asan-*.log"
 fi
 
-# Builds a program with em++ into its own static site and runs a browser test on it.
-test_wasm() {  # name, source, test
+# Builds a program with em++ into its own static site and runs its browser tests there.
+test_wasm() {  # name, source, "test,test"
     local site="$OUT/site-$1"
     mkdir -p "$site"
-    build "wasm-$1" em++ -std=c++20 -O2 -m64 -fexceptions -lembind -sALLOW_MEMORY_GROWTH -I. "$2" -o "$site/app.js" || return
+    build "wasm-$1" em++ -std=c++23 -O2 -m64 -fexceptions -lembind -sALLOW_MEMORY_GROWTH -I. "$2" -o "$site/app.js" || return
     cp web/index.html web/volt2.js "$site/"
     port=$((port + 1))
     python3 -m http.server "$port" --bind 127.0.0.1 --directory "$site" > "$OUT/static-$1.log" 2>&1 &
     local pid=$!
     if wait_for "http://127.0.0.1:$port/"; then
-        node "tests/$3.test.cjs" "http://127.0.0.1:$port/" || fail "wasm: $3 test"
+        for t in ${3//,/ }; do node "tests/$t.test.cjs" "http://127.0.0.1:$port/" || fail "wasm $1: $t test"; done
     else
-        fail "wasm: static server did not start"
+        fail "wasm $1: static server did not start"
     fi
     kill "$pid" 2> /dev/null
     wait "$pid" 2> /dev/null
@@ -120,15 +142,17 @@ test_wasm() {  # name, source, test
 
 if have em++; then
     step "WebAssembly (em++ -m64), served as static files"
-    test_wasm counter "$COUNTER" counter
-    test_wasm lifetime "$LIFETIME" lifetime
+    for entry in "${PROGRAMS[@]}"; do
+        read -r program source _ tests <<< "$entry"
+        test_wasm "$program" "$source" "$tests"
+    done
 else
     step "WebAssembly: skipped (activate Emscripten to include it)"
 fi
 
 if have x86_64-w64-mingw32-g++-posix; then
     step "Windows build (MinGW)"
-    if build_both mingw .exe x86_64-w64-mingw32-g++-posix "${FLAGS[@]}" -O1 -static -lws2_32; then
+    if build_all mingw .exe x86_64-w64-mingw32-g++-posix "${FLAGS[@]}" -O1 -static -lws2_32; then
         if have wine; then
             export WINEPREFIX="${WINEPREFIX:-$PWD/build/wineprefix}" WINEDEBUG=-all
             test_native mingw wine .exe
