@@ -75,6 +75,9 @@ destroys it when that page goes away (reloaded, or replaced by another tab):
 - its **constructor** is the one-time setup,
 - its **destructor** is the cleanup.
 
+`invalidate()` (a `Session` member) renders the page again. Event handlers do that by themselves;
+call it from C++ that changes state some other way, or from the handlers that don't (see Events below).
+
 `volt2::run(site)` works out the session type from `site`'s parameter. Any default-constructible
 type derived from `volt2::Session` works; anything else is a compile error.
 
@@ -91,14 +94,22 @@ An element is `tag::Name[props...](children...)`; with no props, `tag::Name(chil
 - **Tags:** `tag::Div`, `tag::Button`, `tag::Input`, ... every HTML element, in PascalCase, so names
   that are C++ keywords need no underscores (`tag::Template`). Make your own with
   `inline constexpr volt2::Tag MyWidget{"my-widget"};`.
-- **Attributes:** `attr::Id = "x"`, `attr::Disabled = true` (`false` leaves it out),
-  `attr::TabIndex = 3`, `attr::Data("role") = "menu"` for `data-role`, `attr::Aria("label") = "..."`,
-  and `attr::Named("anything") = "..."` for the rest.
+- **Attributes:** `attr::Id = "x"`, `attr::TabIndex = 3`, `attr::Data("role") = "menu"` for
+  `data-role`, `attr::Aria("label") = "..."`, and `attr::Named("anything") = "..."` for the rest.
+  Integers are written exactly. `= true` and `= false` follow each attribute: HTML boolean attributes
+  (`attr::Disabled`, `attr::Checked`, `attr::Hidden`, ...) are written or left out; `attr::Draggable`,
+  `attr::SpellCheck`, `attr::ContentEditable`, `attr::Aria(...)` and `attr::Data(...)` get `"true"` or
+  `"false"`; any other attribute refuses `true`/`false` at compile time, so write the string you mean.
 - **Events:** `event::OnClick`, `event::OnInput`, `event::OnSubmit`, `event::OnKeyDown`, ... and
   `event::On("my-event", handler)` for any other type. A handler takes the event (`const Value&`)
-  or nothing. After any handler runs, volt2 calls your site again and renders the result.
-  `e.call("preventDefault")` and `e.call("stopPropagation")` work, also while developing, because
-  every call to the page is synchronous.
+  or nothing; the event's `currentTarget` is the handler's own element. After a handler runs, volt2
+  calls your site again and renders the result. `e.call("preventDefault")` and
+  `e.call("stopPropagation")` work, also while developing, because every call to the page is
+  synchronous.
+- **Events elements fire on their own** (`OnLoad`, `OnError`, `OnToggle`, media and animation events)
+  don't render by themselves: a render recreates the element, which would fire the event again and
+  loop. When such a handler changes state, have it call `s.invalidate()`, and only when something
+  changed, for example `if (!s.loaded) { s.loaded = true; s.invalidate(); }`.
 - **Children:** elements, text, numbers, `std::optional<VirtualNode>`, and ranges of elements, such
   as a `std::vector<VirtualNode>` or `items | std::views::transform(...)`. `VirtualNode()` renders
   nothing, which is handy in conditionals: `open ? tag::P("details") : VirtualNode()`.
@@ -176,7 +187,8 @@ target upward, in one call; C++ runs their handlers and renders once.
 - **Every render rebuilds the page's elements.** Identity preservation (Volt's diff) comes later, so
   for now a render loses focus, selection, scroll positions inside elements, and text typed into an
   input that the render recreates. An `OnInput` handler therefore interrupts typing after each
-  character.
+  character, and elements re-fire their own events such as `load` (which is why those don't render
+  by themselves).
 - In development every operation is a round trip to the page, about 2 ms in our tests; a render or
   an event is one or two.
 - Reloading the page runs your site again from scratch with a new session. A second tab replaces the

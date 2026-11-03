@@ -133,7 +133,8 @@
         mount.addEventListener(type, function (event) { deliver(mount, event); }, true);
       }
     }
-    for (const child of node.c) element.appendChild(build(child, state, mount));
+    const parent = node.t === 'template' ? element.content : element; // a template's children are its content
+    for (const child of node.c) parent.appendChild(build(child, state, mount));
     return element;
   }
 
@@ -152,15 +153,35 @@
     return undefined;
   }
 
+  // The event as one handler sees it: currentTarget is that handler's element (the real
+  // event's is the mount, where the listener is). Everything else, methods included,
+  // goes to the real event.
+  function eventFor(event, element) {
+    return new Proxy(event, {
+      get: function (target, key) {
+        if (key === 'currentTarget') return element;
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+      set: function (target, key, value) {
+        return Reflect.set(target, key, value, target);
+      },
+    });
+  }
+
   function deliver(mount, event) {
     const state = mounts.get(mount);
     const chain = [];
+    const views = [];
     for (let node = event.target; node && node !== mount; node = node.parentNode) {
       const info = state.nodes.get(node);
-      if (info && info.types.indexOf(event.type) >= 0) chain.push(info.index);
+      if (info && info.types.indexOf(event.type) >= 0) {
+        chain.push(info.index);
+        views.push(eventFor(event, node));
+      }
       if (!event.bubbles) break;
     }
-    if (chain.length) state.dispatch(JSON.stringify(chain), event.type, event);
+    if (chain.length) state.dispatch.apply(null, [JSON.stringify(chain), event.type].concat(views));
   }
 
   // Runs one operation for C++. Errors are returned, never thrown across the bridge.

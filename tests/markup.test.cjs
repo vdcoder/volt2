@@ -24,7 +24,31 @@ function check(condition, message) {
     await page.waitForSelector('#root', { timeout: 15000 });
     const mode = await page.evaluate(() => volt2.mode);
     console.log(`  (${mode} build)`);
-    check((await text('#lifecycle')) === 'constructed 1, destroyed 0, renders 1', `session constructed once: "${await text('#lifecycle')}"`);
+    check(/^constructed 1, destroyed 0, renders \d+$/.test(await text('#lifecycle')), `session constructed once: "${await text('#lifecycle')}"`);
+
+    await page.waitForFunction(() => document.getElementById('image')?.textContent === 'image loaded', null, { timeout: 5000 });
+    const settled = await renders();
+    await page.waitForTimeout(800);
+    check((await renders()) === settled, `an image's load event does not loop (renders ${settled} -> ${await renders()})`);
+
+    await page.evaluate(() => window.cppBump());
+    check((await text('#bumps')) === 'bumps 1', 'invalidate() renders from C++ called outside any event');
+
+    await page.click('#ct-inner');
+    check((await text('#targets')) === 'ct-inner;ct-outer;', `currentTarget is each handler's own element: "${await text('#targets')}"`);
+
+    const template = await page.$eval('#tpl', (el) => ({ content: el.content.childNodes.length, direct: el.childNodes.length }));
+    check(template.content === 1 && template.direct === 0, `a template's children are its content: ${JSON.stringify(template)}`);
+
+    const big = await page.$eval('#big', (el) => ({ text: el.textContent, data: el.dataset.n }));
+    check(big.text === '9007199254740993 -9007199254740993' && big.data === '9007199254740993', `integers stay exact: ${JSON.stringify(big)}`);
+
+    const flags = await page.$eval('#flags', (el) => ({
+      draggable: el.getAttribute('draggable'), spellcheck: el.getAttribute('spellcheck'), hidden: el.hasAttribute('hidden'),
+      expanded: el.getAttribute('aria-expanded'), on: el.dataset.on,
+    }));
+    check(flags.draggable === 'true' && flags.spellcheck === 'false' && !flags.hidden && flags.expanded === 'true' && flags.on === 'false',
+      `true/false follows each attribute: ${JSON.stringify(flags)}`);
 
     const box = await page.$eval('#box', (el) => ({
       type: el.getAttribute('type'), checked: el.hasAttribute('checked') && el.checked, disabled: el.hasAttribute('disabled'),
@@ -68,8 +92,8 @@ function check(condition, message) {
 
     await page.reload();
     await page.waitForSelector('#root');
-    const expected = mode === 'development' ? 'constructed 2, destroyed 1, renders 1' : 'constructed 1, destroyed 0, renders 1';
-    check((await text('#lifecycle')) === expected, `a reload gets a fresh session, the old one destroyed: "${await text('#lifecycle')}"`);
+    const expected = mode === 'development' ? /^constructed 2, destroyed 1, renders \d+$/ : /^constructed 1, destroyed 0, renders \d+$/;
+    check(expected.test(await text('#lifecycle')), `a reload gets a fresh session, the old one destroyed: "${await text('#lifecycle')}"`);
     check((await page.title()) !== 'set by a destroyed session', `a destroyed session's JavaScript calls do not reach the new page (title "${await page.title()}")`);
 
     const unexpected = errors.filter((e) => !/handler failed/.test(e));

@@ -525,6 +525,11 @@ struct Stats {
 // ============================================================================
 // Runtime state and the call dispatch shared by both builds
 // ============================================================================
+namespace detail {
+class Renderer;
+struct Sessions;
+}  // namespace detail
+
 // Your session type derives from this. volt2 creates one per page load and destroys it
 // when that page goes away (reloaded, or replaced by another tab): its constructor is the
 // one-time setup, its members are the page's state, its destructor the cleanup.
@@ -534,6 +539,16 @@ public:
     virtual ~Session() = default;
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
+
+    // Renders the page again. Event handlers do this by themselves, except for events
+    // that elements fire on their own (load, error, toggle, media and animation events):
+    // a render recreates those elements, which would fire the event again and loop. Call
+    // it from such a handler when its state changed, or from other C++ that changes state.
+    void invalidate();
+
+private:
+    friend struct detail::Sessions;
+    detail::Renderer* renderer_ = nullptr;
 };
 
 template <class S>
@@ -1127,13 +1142,23 @@ struct Prop {
     std::function<void(const js::Value&)> handler;
 };
 
-inline std::string numberText(double number) {
-    if (std::isfinite(number) && std::trunc(number) == number && std::fabs(number) < 1e15) {
-        return std::to_string(static_cast<long long>(number));
+// Integers are written exactly; other numbers as JavaScript would show them.
+template <class N>
+std::string numberText(N number) {
+    if constexpr (std::is_integral_v<N>) {
+        return std::to_string(number);
+    } else {
+        double value = static_cast<double>(number);
+        if (std::isfinite(value) && std::trunc(value) == value && std::fabs(value) < 1e15) {
+            return std::to_string(static_cast<long long>(value));
+        }
+        if (!std::isfinite(value)) return std::isnan(value) ? "NaN" : value > 0 ? "Infinity" : "-Infinity";
+        return Json::number(value).dump();
     }
-    Json json = Json::number(number);
-    return std::isfinite(number) ? json.dump() : (std::isnan(number) ? "NaN" : number > 0 ? "Infinity" : "-Infinity");
 }
+
+template <class>
+inline constexpr bool dependentFalse = false;
 
 }  // namespace detail
 
@@ -1193,7 +1218,7 @@ struct Children {
         } else if constexpr (TextChild<T>) {
             out.push_back(text(std::string(std::string_view(child))));
         } else if constexpr (NumberChild<T>) {
-            out.push_back(text(numberText(static_cast<double>(child))));
+            out.push_back(text(numberText(std::remove_cvref_t<T>(child))));
         } else if constexpr (OptionalChild<T>) {
             if (child) append(out, *std::forward<T>(child));
         } else {
@@ -1271,8 +1296,15 @@ private:
     std::string_view name_;
 };
 
-// An attribute: attr::Id = "main", attr::Disabled = true (false leaves it out), attr::TabIndex = 3.
-template <class Name>
+// How an attribute writes `= true` and `= false`.
+enum class Booleans {
+    None,       // not a boolean: `= true` is a compile error
+    Presence,   // HTML boolean attributes: true writes it (as ""), false leaves it out
+    TrueFalse,  // draggable, spellcheck, contenteditable, aria-*, data-*: "true" or "false"
+};
+
+// An attribute: attr::Id = "main", attr::Disabled = true, attr::TabIndex = 3.
+template <class Name, Booleans Bools = Booleans::None>
 class BasicAttribute {
 public:
     constexpr explicit BasicAttribute(Name name) : name_(std::move(name)) {}
@@ -1281,14 +1313,23 @@ public:
         return {detail::Prop::Kind::Attribute, std::string(name_), std::string(value), {}};
     }
     template <std::same_as<bool> B>
-    detail::Prop operator=(B present) const {
-        if (!present) return {};
-        return {detail::Prop::Kind::Attribute, std::string(name_), std::string(), {}};
+    detail::Prop operator=(B value) const {
+        if constexpr (Bools == Booleans::Presence) {
+            if (!value) return {};
+            return {detail::Prop::Kind::Attribute, std::string(name_), std::string(), {}};
+        } else if constexpr (Bools == Booleans::TrueFalse) {
+            return {detail::Prop::Kind::Attribute, std::string(name_), value ? "true" : "false", {}};
+        } else {
+            static_assert(detail::dependentFalse<B>,
+                          "volt2: this attribute does not take true/false. Write the value as a string: \"\" for a "
+                          "present boolean attribute, or \"true\"/\"false\" if that is what the attribute expects.");
+            return {};
+        }
     }
     template <class N>
         requires(std::is_arithmetic_v<N> && !std::same_as<N, bool> && !std::same_as<N, char>)
     detail::Prop operator=(N number) const {
-        return {detail::Prop::Kind::Attribute, std::string(name_), detail::numberText(static_cast<double>(number)), {}};
+        return {detail::Prop::Kind::Attribute, std::string(name_), detail::numberText(number), {}};
     }
 
 private:
@@ -1296,6 +1337,8 @@ private:
 };
 
 using AttributeName = BasicAttribute<std::string_view>;
+using BooleanAttribute = BasicAttribute<std::string_view, Booleans::Presence>;
+using TrueFalseAttribute = BasicAttribute<std::string_view, Booleans::TrueFalse>;
 
 // Element names, PascalCase so names like Template and Object need no underscores.
 namespace tag {
@@ -1319,29 +1362,42 @@ inline constexpr Tag A{"a"}, Abbr{"abbr"}, Address{"address"}, Area{"area"}, Art
 // Attribute names. attr::Data("id") is data-id, attr::Aria("label") is aria-label, and
 // attr::Named("x") is any other attribute.
 namespace attr {
+// HTML boolean attributes: `= true` writes them, `= false` leaves them out.
+inline constexpr BooleanAttribute AutoFocus{"autofocus"}, AutoPlay{"autoplay"}, Checked{"checked"},
+    Controls{"controls"}, Default{"default"}, Disabled{"disabled"}, Hidden{"hidden"}, Loop{"loop"},
+    Multiple{"multiple"}, Muted{"muted"}, NoValidate{"novalidate"}, Open{"open"}, ReadOnly{"readonly"},
+    Required{"required"}, Reversed{"reversed"}, Selected{"selected"};
+// Attributes whose value is the word "true" or "false".
+inline constexpr TrueFalseAttribute ContentEditable{"contenteditable"}, Draggable{"draggable"},
+    SpellCheck{"spellcheck"};
+// Everything else takes strings and numbers.
 inline constexpr AttributeName Accept{"accept"}, AccessKey{"accesskey"}, Action{"action"}, Alt{"alt"},
-    AutoComplete{"autocomplete"}, AutoFocus{"autofocus"}, AutoPlay{"autoplay"}, Checked{"checked"}, Cite{"cite"},
-    Class{"class"}, Cols{"cols"}, ColSpan{"colspan"}, Content{"content"}, ContentEditable{"contenteditable"},
-    Controls{"controls"}, CrossOrigin{"crossorigin"}, DateTime{"datetime"}, Default{"default"}, Dir{"dir"},
-    Disabled{"disabled"}, Download{"download"}, Draggable{"draggable"}, EncType{"enctype"}, For{"for"}, Form{"form"},
-    Headers{"headers"}, Height{"height"}, Hidden{"hidden"}, High{"high"}, Href{"href"}, HrefLang{"hreflang"},
-    Id{"id"}, InputMode{"inputmode"}, Kind{"kind"}, Label{"label"}, Lang{"lang"}, List{"list"}, Loading{"loading"},
-    Loop{"loop"}, Low{"low"}, Max{"max"}, MaxLength{"maxlength"}, Media{"media"}, Method{"method"}, Min{"min"},
-    MinLength{"minlength"}, Multiple{"multiple"}, Muted{"muted"}, Name{"name"}, NoValidate{"novalidate"},
-    Open{"open"}, Optimum{"optimum"}, Pattern{"pattern"}, Placeholder{"placeholder"}, Poster{"poster"},
-    Preload{"preload"}, ReadOnly{"readonly"}, Rel{"rel"}, Required{"required"}, Reversed{"reversed"}, Role{"role"},
-    Rows{"rows"}, RowSpan{"rowspan"}, Sandbox{"sandbox"}, Scope{"scope"}, Selected{"selected"}, Size{"size"},
-    Sizes{"sizes"}, Span{"span"}, SpellCheck{"spellcheck"}, Src{"src"}, SrcDoc{"srcdoc"}, SrcLang{"srclang"},
-    SrcSet{"srcset"}, Start{"start"}, Step{"step"}, Style{"style"}, TabIndex{"tabindex"}, Target{"target"},
-    Title{"title"}, Translate{"translate"}, Type{"type"}, Value{"value"}, Width{"width"}, Wrap{"wrap"};
+    AutoComplete{"autocomplete"}, Cite{"cite"}, Class{"class"}, Cols{"cols"}, ColSpan{"colspan"}, Content{"content"},
+    CrossOrigin{"crossorigin"}, DateTime{"datetime"}, Dir{"dir"}, Download{"download"}, EncType{"enctype"},
+    For{"for"}, Form{"form"}, Headers{"headers"}, Height{"height"}, High{"high"}, Href{"href"},
+    HrefLang{"hreflang"}, Id{"id"}, InputMode{"inputmode"}, Kind{"kind"}, Label{"label"}, Lang{"lang"},
+    List{"list"}, Loading{"loading"}, Low{"low"}, Max{"max"}, MaxLength{"maxlength"}, Media{"media"},
+    Method{"method"}, Min{"min"}, MinLength{"minlength"}, Name{"name"}, Optimum{"optimum"}, Pattern{"pattern"},
+    Placeholder{"placeholder"}, Poster{"poster"}, Preload{"preload"}, Rel{"rel"}, Role{"role"}, Rows{"rows"},
+    RowSpan{"rowspan"}, Sandbox{"sandbox"}, Scope{"scope"}, Size{"size"}, Sizes{"sizes"}, Span{"span"},
+    Src{"src"}, SrcDoc{"srcdoc"}, SrcLang{"srclang"}, SrcSet{"srcset"}, Start{"start"}, Step{"step"},
+    Style{"style"}, TabIndex{"tabindex"}, Target{"target"}, Title{"title"}, Translate{"translate"}, Type{"type"},
+    Value{"value"}, Width{"width"}, Wrap{"wrap"};
 
 inline BasicAttribute<std::string> Named(std::string_view name) { return BasicAttribute<std::string>(std::string(name)); }
-inline BasicAttribute<std::string> Data(std::string_view key) { return Named("data-" + std::string(key)); }
-inline BasicAttribute<std::string> Aria(std::string_view key) { return Named("aria-" + std::string(key)); }
+// data-* and aria-* write `= true` and `= false` as "true" and "false".
+inline BasicAttribute<std::string, Booleans::TrueFalse> Data(std::string_view key) {
+    return BasicAttribute<std::string, Booleans::TrueFalse>("data-" + std::string(key));
+}
+inline BasicAttribute<std::string, Booleans::TrueFalse> Aria(std::string_view key) {
+    return BasicAttribute<std::string, Booleans::TrueFalse>("aria-" + std::string(key));
+}
 }  // namespace attr
 
 // Event handlers: event::OnClick(handler). A handler takes the event (const Value&) or
-// nothing. After a handler runs, volt2 renders the page again.
+// nothing; the event's currentTarget is the handler's own element. After a handler runs,
+// volt2 renders the page again, except after events the elements fire on their own
+// (see Session::invalidate).
 namespace event {
 template <class F>
 concept Handler = std::invocable<F&, const js::Value&> || std::invocable<F&>;
@@ -1436,9 +1492,41 @@ public:
         renderNow();
     }
 
+    // Session::invalidate.
+    void invalidate() {
+        if (rendering_) return;  // the render in progress already shows the latest state
+        if (depth_ > 0) {        // handlers are running: render once, when they finish
+            pending_ = true;
+            return;
+        }
+        renderNow();
+    }
+
 private:
+    // Events that elements fire by themselves. A render recreates the elements (no
+    // identity preservation yet), which would fire these again: rendering after them
+    // automatically would loop, so they render only through Session::invalidate.
+    static bool firedByElement(std::string_view type) {
+        static constexpr std::string_view types[] = {
+            "load", "error", "abort", "toggle", "beforetoggle", "animationstart", "animationend", "animationiteration",
+            "animationcancel", "transitionrun", "transitionstart", "transitionend", "transitioncancel", "loadstart",
+            "loadeddata", "loadedmetadata", "canplay", "canplaythrough", "durationchange", "emptied", "ended", "pause",
+            "play", "playing", "progress", "ratechange", "seeked", "seeking", "stalled", "suspend", "timeupdate",
+            "volumechange", "waiting"};
+        for (std::string_view known : types) {
+            if (known == type) return true;
+        }
+        return false;
+    }
+
     // One message per render: the whole tree as JSON; volt2.js builds the elements.
     void renderNow() {
+        rendering_ = true;
+        pending_ = false;
+        struct Done {
+            bool& flag;
+            ~Done() { flag = false; }
+        } done{rendering_};
         VirtualNode next = render_();
         current_ = std::move(next);  // the previous tree goes only now, after its handlers ran
         withHandlers_.clear();
@@ -1479,20 +1567,22 @@ private:
     }
 
     // Called by volt2.js with the elements that have handlers for this event, from the
-    // target upward. Handlers run first, then the page renders once. A handler that
-    // makes another event fire (element.call("click")) runs that one too, on the same
-    // tree, and the render still happens once, at the end.
+    // target upward, and for each one a view of the event whose currentTarget is that
+    // element. Handlers run first, then the page renders once. A handler that makes
+    // another event fire (element.call("click")) runs that one too, on the same tree,
+    // and the render still happens once, at the end.
     void dispatch(const js::Args& args) {
         Json chain = Json::parse(args.at(0).as<std::string>());
         const std::string type = args.at(1).as<std::string>();
-        const js::Value& event = args.at(2);
+        if (!firedByElement(type)) pending_ = true;
         ++depth_;
         std::exception_ptr failure;
         try {
             const auto& indices = chain.items();
-            for (std::size_t n = 0; n < indices.size(); ++n) {
+            for (std::size_t n = 0; n < indices.size() && n + 2 < args.size(); ++n) {
                 auto index = static_cast<std::size_t>(indices[n].asNumber());
                 if (index >= withHandlers_.size()) break;
+                const js::Value& event = args[n + 2];
                 for (const Prop& prop : withHandlers_[index]->props_) {
                     if (prop.kind == Prop::Kind::Event && prop.name == type) prop.handler(event);
                 }
@@ -1504,7 +1594,7 @@ private:
         } catch (...) {
             failure = std::current_exception();
         }
-        if (--depth_ == 0) renderNow();  // also after a failing handler, to show what changed
+        if (--depth_ == 0 && pending_) renderNow();  // also after a failing handler, to show what changed
         if (failure) std::rethrow_exception(failure);
     }
 
@@ -1513,6 +1603,13 @@ private:
     VirtualNode current_;
     std::vector<const VirtualNode*> withHandlers_;  // index in the JSON -> node in current_
     int depth_ = 0;
+    bool pending_ = false;    // a render is due when the handlers finish
+    bool rendering_ = false;
+};
+
+struct Sessions {
+    static void attach(Session& session, Renderer* renderer) { session.renderer_ = renderer; }
+    static Renderer* renderer(const Session& session) { return session.renderer_; }
 };
 
 // How to start a site, built by run() from your session type and functions.
@@ -1552,6 +1649,7 @@ inline void startPage(const SiteDefinition& site) {
             page->renderer = std::make_unique<Renderer>([&session = *page->session, render = site.render] {
                 return render(session);
             });
+            Sessions::attach(*page->session, page->renderer.get());
             page->renderer->start();
         } else if (site.start) {
             site.start(*page->session);
@@ -1567,6 +1665,11 @@ inline void startPage(const SiteDefinition& site) {
 inline int runSite(SiteDefinition site, Options options);
 
 }  // namespace detail
+
+inline void Session::invalidate() {
+    detail::requireVoltThread();
+    if (renderer_) renderer_->invalidate();
+}
 
 // A rendered site. volt2 creates your session (one per page load), calls render to get
 // the page, and calls it again after every event handler:
@@ -1740,7 +1843,8 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
         mount.addEventListener(type, function (event) { deliver(mount, event); }, true);
       }
     }
-    for (const child of node.c) element.appendChild(build(child, state, mount));
+    const parent = node.t === 'template' ? element.content : element; // a template's children are its content
+    for (const child of node.c) parent.appendChild(build(child, state, mount));
     return element;
   }
 
@@ -1759,15 +1863,35 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
     return undefined;
   }
 
+  // The event as one handler sees it: currentTarget is that handler's element (the real
+  // event's is the mount, where the listener is). Everything else, methods included,
+  // goes to the real event.
+  function eventFor(event, element) {
+    return new Proxy(event, {
+      get: function (target, key) {
+        if (key === 'currentTarget') return element;
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+      set: function (target, key, value) {
+        return Reflect.set(target, key, value, target);
+      },
+    });
+  }
+
   function deliver(mount, event) {
     const state = mounts.get(mount);
     const chain = [];
+    const views = [];
     for (let node = event.target; node && node !== mount; node = node.parentNode) {
       const info = state.nodes.get(node);
-      if (info && info.types.indexOf(event.type) >= 0) chain.push(info.index);
+      if (info && info.types.indexOf(event.type) >= 0) {
+        chain.push(info.index);
+        views.push(eventFor(event, node));
+      }
       if (!event.bubbles) break;
     }
-    if (chain.length) state.dispatch(JSON.stringify(chain), event.type, event);
+    if (chain.length) state.dispatch.apply(null, [JSON.stringify(chain), event.type].concat(views));
   }
 
   // Runs one operation for C++. Errors are returned, never thrown across the bridge.
@@ -2179,8 +2303,8 @@ inline void openBrowser(const std::string& url) {
                     bridge.answer(errorReply("volt2: a newer page replaced this one. Reload to continue."));
                     continue;
                 }
-                beginPage();
-                endPage();  // the previous page load's session and renderer
+                endPage();    // the previous page's session, while its Values are still valid
+                beginPage();  // then forget that page's handles and functions
                 Json reply = returnReply();
                 try {
                     startPage(site);

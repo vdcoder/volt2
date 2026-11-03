@@ -8,18 +8,36 @@
 
 using namespace volt2;
 
+// A 1x1 GIF: loads instantly, and fires load again each time a render recreates the image.
+constexpr const char* kPixel = "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
+
 struct Markup : Session {
     static inline int constructed = 0;
     static inline int destroyed = 0;
     int renders = 0;
     std::vector<std::string> log;
     std::string typed;
+    std::string targets;
+    int loads = 0;
+    bool imageLoaded = false;
+    int bumps = 0;
+    Value document = Value::global("document");
+    js::Function bump;
 
-    Markup() { ++constructed; }
+    Markup() {
+        ++constructed;
+        // C++ that page JavaScript calls outside any event: invalidate() renders.
+        bump = js::function([this] {
+            ++bumps;
+            invalidate();
+        });
+        document["defaultView"].set("cppBump", bump);
+    }
     ~Markup() override {
         ++destroyed;
-        // Runs after this session's page is gone (development): must not reach the new page.
-        Value::global("document").set("title", "set by a destroyed session");
+        // Runs after this session's page is gone (development), through a stored Value:
+        // must neither crash nor reach the new page.
+        document.set("title", "set by a destroyed session");
     }
 };
 
@@ -76,6 +94,34 @@ VirtualNode site(Markup& s) {
             s.log.push_back("throw");
             throw std::runtime_error("handler failed");
         })]("throw"),
+
+        // An element's own events (here load) do not render by themselves, so they cannot
+        // loop; invalidate() renders when the state really changed.
+        tag::Img[attr::Id = "img", attr::Src = kPixel, event::OnLoad([&s] {
+            ++s.loads;
+            if (!s.imageLoaded) {
+                s.imageLoaded = true;
+                s.invalidate();
+            }
+        })](),
+        tag::P[attr::Id = "image"](s.imageLoaded ? "image loaded" : "image loading"),
+        tag::P[attr::Id = "bumps"]("bumps ", s.bumps),
+
+        // currentTarget is each handler's own element.
+        tag::Div[attr::Id = "ct-outer",
+                 event::OnClick([&s](const Value& e) { s.targets += e["currentTarget"]["id"].as<std::string>() + ";"; })](
+            tag::Span[attr::Id = "ct-inner", event::OnClick([&s](const Value& e) {
+                s.targets += e["currentTarget"]["id"].as<std::string>() + ";";
+            })]("x")),
+        tag::P[attr::Id = "targets"](s.targets),
+
+        // A template's children are its content.
+        tag::Template[attr::Id = "tpl"](tag::P("inside")),
+
+        // Integers stay exact; true/false follows each attribute's rules.
+        tag::P[attr::Id = "big", attr::Data("n") = 9007199254740993LL](9007199254740993ULL, " ", -9007199254740993LL),
+        tag::Div[attr::Id = "flags", attr::Draggable = true, attr::SpellCheck = false, attr::Hidden = false,
+                 attr::Aria("expanded") = true, attr::Data("on") = false](),
 
         // A handler that clicks another element: both run, and the page renders once.
         tag::Button[attr::Id = "relay", event::OnClick([&s](const Value& e) {

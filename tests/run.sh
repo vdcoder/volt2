@@ -94,6 +94,17 @@ else
     fail "C++20 error message"
 fi
 
+step "= true is refused for attributes that are not booleans"
+printf '#include "volt2.hpp"\nauto prop = volt2::attr::Id = true;\nint main() {}\n' > "$OUT/bool.cpp"
+if g++ "${FLAGS[@]}" -fsyntax-only "$OUT/bool.cpp" 2> "$OUT/bool.log"; then
+    fail "attr::Id = true was accepted"
+elif grep -q 'does not take true/false' "$OUT/bool.log"; then
+    echo "  ok"
+else
+    head -5 "$OUT/bool.log"
+    fail "attr::Id = true error message"
+fi
+
 step "the README's example compiles"
 awk '/^```cpp$/{n++; if (n == 1) {f = 1; next}} f && /^```$/{exit} f' README.md > "$OUT/readme.cpp"
 build readme g++ "${FLAGS[@]}" -fsyntax-only "$OUT/readme.cpp" && echo "  ok"
