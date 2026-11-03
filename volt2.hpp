@@ -1181,6 +1181,17 @@ private:
     std::vector<VirtualNode> children_;
 };
 
+// Nothing, wherever a prop or a node can go, so conditionals type-check:
+//     tag::Input[s.locked ? attr::ReadOnly = true : None]()
+//     tag::Span[s.tip.empty() ? None : attr::Title = s.tip]()
+//     s.open ? tag::P("details") : None
+struct NoneType {
+    explicit constexpr NoneType(int) {}  // like std::nullopt_t: only volt2::None
+    operator detail::Prop() const { return {}; }
+    operator VirtualNode() const { return {}; }
+};
+inline constexpr NoneType None{0};
+
 namespace detail {
 
 template <class T>
@@ -1216,6 +1227,9 @@ struct Children {
             VirtualNode node(std::forward<T>(child));
             if (!node.isNothing()) out.push_back(std::move(node));
         } else if constexpr (TextChild<T>) {
+            if constexpr (std::is_pointer_v<std::remove_cvref_t<T>>) {  // a pointer, not a string literal
+                if (child == nullptr) return;                                 // a null const char* is nothing, like None
+            }
             out.push_back(text(std::string(std::string_view(child))));
         } else if constexpr (NumberChild<T>) {
             out.push_back(text(numberText(std::remove_cvref_t<T>(child))));
@@ -1236,9 +1250,9 @@ template <class T>
 concept Child = detail::NodeChild<T> || detail::TextChild<T> || detail::NumberChild<T> || detail::OptionalChild<T> ||
                 detail::RangeChild<T>;
 
-// What can go between the brackets: attr:: and event:: props.
+// What can go between the brackets: attr:: and event:: props, or None.
 template <class T>
-concept PropLike = std::same_as<std::remove_cvref_t<T>, detail::Prop>;
+concept PropLike = std::same_as<std::remove_cvref_t<T>, detail::Prop> || std::same_as<std::remove_cvref_t<T>, NoneType>;
 
 // A tag with its props, waiting for its children: what tag::Div[...] returns.
 class Element {
@@ -1278,8 +1292,8 @@ public:
     Element operator[](P&&... props) const {
         std::vector<detail::Prop> list;
         list.reserve(sizeof...(P));
-        auto keep = [&](auto&& prop) {
-            if (prop.kind != detail::Prop::Kind::Absent) list.push_back(std::forward<decltype(prop)>(prop));
+        auto keep = [&](detail::Prop prop) {
+            if (prop.kind != detail::Prop::Kind::Absent) list.push_back(std::move(prop));
         };
         (keep(std::forward<P>(props)), ...);
         return Element(name_, std::move(list));
@@ -1311,6 +1325,18 @@ public:
 
     detail::Prop operator=(std::string_view value) const {
         return {detail::Prop::Kind::Attribute, std::string(name_), std::string(value), {}};
+    }
+    // A null const char* leaves the attribute out, like None.
+    detail::Prop operator=(const char* value) const {
+        if (value == nullptr) return {};
+        return *this = std::string_view(value);
+    }
+    // An empty std::optional leaves the attribute out: attr::Title = s.tooltip.
+    template <class T>
+        requires(std::convertible_to<const T&, std::string_view> || std::is_arithmetic_v<T>)
+    detail::Prop operator=(const std::optional<T>& value) const {
+        if (!value) return {};
+        return *this = *value;
     }
     template <std::same_as<bool> B>
     detail::Prop operator=(B value) const {

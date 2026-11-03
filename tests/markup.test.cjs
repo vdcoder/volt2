@@ -85,6 +85,25 @@ function check(condition, message) {
     check(errors.some((e) => /handler failed/.test(e)), 'a throwing handler reports its error to the page');
     check((await log()).endsWith(',throw'), 'and the page still renders the new state');
 
+    const lockState = () => page.evaluate(() => {
+      const input = document.getElementById('maybe-ro');
+      return { readonly: input.hasAttribute('readonly'), title: input.getAttribute('title'), data: input.hasAttribute('data-x'),
+               placeholder: input.hasAttribute('placeholder'), note: !!document.getElementById('locked-note') };
+    });
+    let state = await lockState();
+    check(!state.readonly && state.title === null && !state.data && !state.placeholder && !state.note,
+      `None, empty optionals and null pointers leave things out: ${JSON.stringify(state)}`);
+    await page.click('#maybe-click');
+    check((await log()).endsWith(',unlocked-click'), 'an event chosen by a conditional is wired up');
+    await page.click('#lock');
+    state = await lockState();
+    check(state.readonly && state.title === 'locked' && !state.data && state.note,
+      `the same conditionals, the other way: ${JSON.stringify(state)}`);
+    const clicks = (await log()).split(',').length;
+    await page.click('#maybe-click');
+    check((await log()).split(',').length === clicks, 'an event replaced by None is not wired up');
+    check((await text('#nones')) === 'text', `None and null text as children render nothing: "${await text('#nones')}"`);
+
     const before = await renders();
     await page.click('#relay');
     check((await log()).endsWith(',relay,inner,outer'), `a handler can make another event fire: "${await log()}"`);

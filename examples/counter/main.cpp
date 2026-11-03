@@ -29,13 +29,13 @@ VirtualNode site(Counter& s) {
         tag::P[attr::Id = "count"]("Clicked ", s.count, " times"),
         tag::Button[attr::Id = "increment", event::OnClick([&s] { ++s.count; })]("Increment"),
         tag::Button[attr::Id = "decrement", event::OnClick([&s] { --s.count; })]("Decrement"),
-        s.count > 10 ? tag::P[attr::Id = "warning", attr::Style = "color: #c00"]("That's a lot of clicks!") : VirtualNode(),
+        s.count > 10 ? tag::P[attr::Id = "warning", attr::Style = "color: #c00"]("That's a lot of clicks!") : None,
 
         tag::H2("Panel"),
         tag::Button[attr::Id = "toggle", event::OnClick([&s] { s.panelOpen = !s.panelOpen; })](
             s.panelOpen ? "Hide the panel" : "Show the panel"),
         s.panelOpen ? tag::Div[attr::Id = "panel"]("Rendered by C++, both while developing and as WebAssembly.")
-                    : VirtualNode(),
+                    : None,
 
         tag::H2("Fruit"),
         tag::Ul[attr::Id = "fruits"](s.fruits | std::views::transform([&s](const std::string& fruit) {

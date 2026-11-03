@@ -111,8 +111,18 @@ An element is `tag::Name[props...](children...)`; with no props, `tag::Name(chil
   loop. When such a handler changes state, have it call `s.invalidate()`, and only when something
   changed, for example `if (!s.loaded) { s.loaded = true; s.invalidate(); }`.
 - **Children:** elements, text, numbers, `std::optional<VirtualNode>`, and ranges of elements, such
-  as a `std::vector<VirtualNode>` or `items | std::views::transform(...)`. `VirtualNode()` renders
-  nothing, which is handy in conditionals: `open ? tag::P("details") : VirtualNode()`.
+  as a `std::vector<VirtualNode>` or `items | std::views::transform(...)`.
+- **Nothing:** `None` stands for no prop between the brackets and no node between the parentheses, so
+  conditionals type-check in both places:
+
+  ```cpp
+  tag::Input[s.locked ? attr::ReadOnly = true : None]()
+  tag::Span[s.tip.empty() ? None : attr::Title = s.tip, s.locked ? None : event::OnClick(onClick)]()
+  s.open ? tag::P("details") : None
+  ```
+
+  An attribute given an empty `std::optional` (`attr::Title = s.tooltip`) or a null `const char*` is
+  left out too, and a null `const char*` child renders nothing.
 
 Text is always text: `tag::P("<b>hi</b>")` shows the angle brackets, it never makes HTML.
 

@@ -21,6 +21,8 @@ struct Markup : Session {
     int loads = 0;
     bool imageLoaded = false;
     int bumps = 0;
+    bool locked = false;
+    std::optional<std::string> tooltip;
     Value document = Value::global("document");
     js::Function bump;
 
@@ -122,6 +124,19 @@ VirtualNode site(Markup& s) {
         tag::P[attr::Id = "big", attr::Data("n") = 9007199254740993LL](9007199254740993ULL, " ", -9007199254740993LL),
         tag::Div[attr::Id = "flags", attr::Draggable = true, attr::SpellCheck = false, attr::Hidden = false,
                  attr::Aria("expanded") = true, attr::Data("on") = false](),
+
+        // None: nothing, wherever a prop or a node can go. std::optional values and null
+        // const char* leave attributes out too. The lock button flips everything below.
+        tag::Button[attr::Id = "lock", event::OnClick([&s] {
+            s.locked = !s.locked;
+            s.tooltip = s.locked ? std::optional<std::string>("locked") : std::nullopt;
+        })]("lock"),
+        tag::Input[attr::Id = "maybe-ro", s.locked ? attr::ReadOnly = true : None, attr::Title = s.tooltip,
+                   attr::Data("x") = std::optional<int>(), attr::Placeholder = static_cast<const char*>(nullptr)](),
+        tag::Span[attr::Id = "maybe-click", s.locked ? None : event::OnClick([&s] { s.log.push_back("unlocked-click"); })](
+            "click me"),
+        s.locked ? tag::P[attr::Id = "locked-note"]("locked") : None,
+        tag::P[attr::Id = "nones", None](None, "text", static_cast<const char*>(nullptr), None),
 
         // A handler that clicks another element: both run, and the page renders once.
         tag::Button[attr::Id = "relay", event::OnClick([&s](const Value& e) {
