@@ -5,16 +5,22 @@
 ```cpp
 #include "volt2.hpp"
 
+using volt2::js::Function;
 using volt2::js::Value;
 
+struct Page {
+    Value button;
+    Function onClick;  // JavaScript can call it for as long as the page holds it
+};
+
 void site(volt2::Session&) {
+    static Page page;
     Value document = Value::global("document");
-    Value button = document.call("createElement", "button");
-    button.set("textContent", "Click me");
-    button.call("addEventListener", "click", volt2::js::function([=] {
-        button.set("textContent", "Clicked from C++");
-    }));
-    document["body"].call("appendChild", button);
+    page.button = document.call("createElement", "button");
+    page.button.set("textContent", "Click me");
+    page.onClick = volt2::js::function([] { page.button.set("textContent", "Clicked from C++"); });
+    page.button.call("addEventListener", "click", page.onClick);
+    document["body"].call("appendChild", page.button);
 }
 
 int main() { return volt2::run(site); }
@@ -44,7 +50,8 @@ g++ -std=c++20 -I. examples/counter/main.cpp -o counter -pthread
 With MinGW, add `-lws2_32`. MSVC links the socket library automatically.
 
 Environment variables: `VOLT2_PORT=8123` picks the port (default: the first free one from 8080),
-`VOLT2_NO_BROWSER=1` stops the browser opening. The same options exist in code:
+`VOLT2_NO_BROWSER=1` stops the browser opening, `VOLT2_WARN_AT=500` sets when the leak warning
+starts (see [Lifetimes](#lifetimes)). The same options exist in code:
 `volt2::run(site, {.port = 8123, .openBrowser = false})`.
 
 ## Deploy
@@ -73,8 +80,10 @@ This first version is the foundation: C++ and the page calling each other. Rende
 | `f(a, b)` | `f(a, b)` for a function value |
 | `v.new_(a)` | `new v(a)` |
 | `v.as<bool>()`, `as<double>()`, `as<int>()`, `as<std::string>()` | truthiness and checked conversions |
-| `v.typeOf()`, `v.strictlyEquals(w)` | `typeof v`, `v === w` |
-| `volt2::js::function(lambda)` | a JS function that calls your C++ |
+| `v.typeOf()`, `v.strictlyEquals(w)` | `typeof v`, `v === w` (objects compare locally) |
+| `v == w`, `std::hash<Value>` | JS `Map` key equality, so a `Value` can key an `unordered_map` |
+| `volt2::js::function(lambda)` | a `js::Function`: a JS function that calls your C++, while you hold it |
+| `volt2::stats()` | how many page objects and functions C++ holds |
 
 `Value` mirrors the shape of `emscripten::val`. Every call is synchronous and can nest in both
 directions: a C++ handler can read `window.someFlag`, call a page function, or trigger a listener
@@ -83,6 +92,26 @@ a C++ exception thrown from a `js::function` becomes a JavaScript `Error` in the
 
 `js::function` takes a lambda with `(const volt2::js::Args&)`, `(const volt2::js::Value& first)` or
 no parameters, returning `void` or anything that can be passed to JavaScript.
+
+## Lifetimes
+
+- **Page objects.** A JavaScript object stays alive while any `Value` refers to it, and is released
+  when the last one is destroyed. Each object has exactly one handle, so `strictlyEquals` and `==`
+  compare objects without asking the page, and a `Value` can be a map key (for example by element).
+- **C++ functions.** `volt2::js::function` returns a `js::Function`, which works for as long as you
+  hold it. Copies share it; when the last copy is destroyed the C++ function (and everything its
+  lambda captured) is released, and calling it from JavaScript throws. Pass it to JavaScript by
+  name, from a variable that lives long enough, typically a member of the object that uses it.
+  Passing a temporary, such as `call("addEventListener", "click", volt2::js::function(...))`, is a
+  compile error, because it would be released when the statement ends.
+- **Threads.** Values, functions and `volt2::stats()` belong to the thread that called `volt2::run`;
+  using them on another thread throws a `js::Error`. Destroying one on another thread is safe: the
+  release is queued and applied on volt2's thread before its next operation or call, so a released
+  function can never be called again.
+- **Leaks.** `volt2::stats()` reports how many page objects and functions C++ holds. While developing,
+  volt2 warns in your console and the browser console when either passes 10,000 (`VOLT2_WARN_AT`),
+  then again each time the count doubles.
+- **Reloads.** A page reload releases everything that belonged to the previous page.
 
 ## How it works
 
@@ -103,7 +132,6 @@ JavaScript objects that C++ holds are kept in a table in the page and released w
   writes comes with the rendering engine.
 - Reloading the page runs your site again from scratch. A second tab replaces the first, which is
   told so on its next call. (One page at a time for now.)
-- C++ functions passed to JavaScript live until the page is reloaded.
 - Your site and every handler run on the thread that called `volt2::run`, one at a time, like
   JavaScript.
 - Development relies on synchronous requests on the page's main thread, which browsers deprecate
@@ -111,8 +139,8 @@ JavaScript objects that C++ holds are kept in a table in the page and released w
 
 ## Tests
 
-`tests/run.sh` builds `examples/counter` every way the machine supports and runs the browser tests
-(`tests/counter.test.cjs`, `tests/reload.test.cjs`) against each build: g++, clang, ThreadSanitizer,
+`tests/run.sh` builds `examples/counter` and the `tests/lifetime` program every way the machine
+supports and runs the browser tests (`counter`, `reload`, `lifetime`) against each build: g++, clang, ThreadSanitizer,
 AddressSanitizer with UndefinedBehaviorSanitizer, WebAssembly (with Emscripten activated), and the
 Windows build via MinGW and Wine when installed. It needs Node and Playwright:
 
@@ -126,7 +154,9 @@ After editing `web/volt2.js`, run `python3 tools/embed_js.py` to update the copy
 
 ## Roadmap
 
-1. ~~The bridge, on both builds~~ (this version)
+1. ~~The bridge, on both builds~~
+   - ~~Lifetimes: owned functions, one handle per object, thread check, leak visibility~~ (this version)
+   - Async: awaiting JavaScript promises with C++20 coroutines, and JavaScript awaiting C++
 2. Rendering: port Volt's tree and diff onto `js::Value`, with write batching
 3. Events and inputs: event values, `preventDefault`, focus protection
 4. Browser APIs: timers, fetch, storage, console, each driven by JavaScript callbacks

@@ -6,13 +6,15 @@
 // calls C++ functions through callNative. Values cross as JSON: booleans, finite
 // numbers, strings and null as themselves; undefined as {u:1}; NaN and the
 // infinities as {f:"NaN"}; anything else as {h:id}, a handle that C++ releases
-// when it no longer needs it.
+// when it no longer needs it. An object keeps the same id for as long as C++ holds
+// it, so C++ can compare objects without asking the page.
 //
 // volt2.hpp embeds a copy of this file. After editing it, run tools/embed_js.py.
 (function () {
   'use strict';
 
-  const handles = new Map();
+  const handles = new Map(); // id -> value
+  const idOf = new Map(); // value -> id, for values C++ currently holds
   let nextHandle = 1;
   let transport = null; // (message) => reply; set by startDev or attachWasm
 
@@ -27,8 +29,12 @@
         return Number.isFinite(value) ? value : { f: String(value) };
       default: {
         if (value === null) return null;
-        const id = nextHandle++;
-        handles.set(id, value);
+        let id = idOf.get(value);
+        if (id === undefined) {
+          id = nextHandle++; // never reused, so a released id cannot mean another object
+          handles.set(id, value);
+          idOf.set(value, id);
+        }
         return { h: id };
       }
     }
@@ -46,7 +52,11 @@
   }
 
   function release(ids) {
-    if (ids) for (const id of ids) handles.delete(id);
+    if (!ids) return;
+    for (const id of ids) {
+      if (handles.has(id)) idOf.delete(handles.get(id));
+      handles.delete(id);
+    }
   }
 
   function kind(value) {
@@ -80,8 +90,6 @@
         return Reflect.construct(fromWire(op.o), args);
       case 'typeof':
         return typeof fromWire(op.o);
-      case 'eq':
-        return fromWire(op.o) === fromWire(op.v);
       case 'fn': {
         const id = op.k;
         return function () {
@@ -94,14 +102,14 @@
   }
 
   // Runs one operation for C++. Errors are returned, never thrown across the bridge.
-  // Released handles are dropped afterwards, so a reply may still refer to them.
+  // Releases come first: C++ released those ids before sending, so if the result is one
+  // of those objects it must get a fresh id. (The operation itself never uses them.)
   function exec(op) {
+    release(op.rel);
     try {
       return { v: toWire(perform(op)) };
     } catch (e) {
       return { error: e instanceof Error ? e.name + ': ' + e.message : String(e) };
-    } finally {
-      release(op.rel);
     }
   }
 
@@ -136,6 +144,7 @@
   }
 
   function startDev() {
+    api.mode = 'development';
     const page = Date.now().toString(36) + Math.random().toString(36).slice(2);
     transport = function (message) {
       message.s = page;
@@ -159,6 +168,7 @@
   }
 
   function attachWasm(dispatch) {
+    api.mode = 'webassembly';
     transport = function (message) {
       return JSON.parse(dispatch(JSON.stringify(message)));
     };
@@ -168,7 +178,8 @@
     return JSON.stringify(exec(JSON.parse(text)));
   }
 
-  globalThis.volt2 = {
+  const api = {
+    mode: 'not started', // then 'development' or 'webassembly'
     startDev: startDev,
     attachWasm: attachWasm,
     execJson: execJson,
@@ -176,4 +187,5 @@
       return handles.size;
     },
   };
+  globalThis.volt2 = api;
 })();

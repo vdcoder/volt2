@@ -8,6 +8,8 @@
 // Development environment variables:
 //   VOLT2_PORT=8123     use this port (default: the first free one from 8080)
 //   VOLT2_NO_BROWSER=1  do not open the browser
+//   VOLT2_WARN_AT=500   warn once C++ holds this many JavaScript values or functions
+//                       (default 10000; the threshold doubles after each warning)
 #pragma once
 
 #if defined(_MSVC_LANG)
@@ -27,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <limits>
@@ -354,12 +357,14 @@ public:
 };
 
 class Value;
+class Function;
 using Args = std::vector<Value>;
 
-// Types that can be passed to JavaScript: Value, nullptr, bool, numbers, strings.
+// Types that can be passed to JavaScript: Value, Function (by name), nullptr, bool, numbers, strings.
 template <class T>
-concept ToJs = std::same_as<std::remove_cvref_t<T>, Value> || std::same_as<std::remove_cvref_t<T>, std::nullptr_t> ||
-               std::is_arithmetic_v<std::remove_cvref_t<T>> || std::convertible_to<T, std::string>;
+concept ToJs = std::same_as<std::remove_cvref_t<T>, Value> || std::same_as<std::remove_cvref_t<T>, Function> ||
+               std::same_as<std::remove_cvref_t<T>, std::nullptr_t> || std::is_arithmetic_v<std::remove_cvref_t<T>> ||
+               std::convertible_to<T, std::string>;
 
 // Types a JavaScript value can be converted to with Value::as.
 template <class T>
@@ -373,8 +378,9 @@ concept CallResult = std::is_void_v<T> || FromJs<T>;
 
 namespace detail {
 
-// A JavaScript object, function or other non-primitive that C++ refers to.
-// The page keeps it alive until the last Value copy referring to it is gone.
+// A JavaScript object, function or other non-primitive that C++ refers to. There is
+// one Handle per object, shared by every Value referring to it; the page keeps the
+// object alive until the last of those Values is gone.
 struct Handle {
     long long id;
     unsigned long long generation;  // which page load the handle belongs to
@@ -387,6 +393,9 @@ struct Handle {
 Json toWire(const js::Value& value);
 js::Value fromWire(const Json& wire);
 Json request(Json op);
+
+using Callback = std::function<js::Value(const js::Args&)>;
+js::Function makeFunction(Callback callback);
 
 }  // namespace detail
 
@@ -442,7 +451,13 @@ public:
     bool isNumber() const { return kind_ == Kind::Number; }
     bool isString() const { return kind_ == Kind::String; }
     std::string typeOf() const;
+    // JavaScript ===. Objects compare by identity, locally: each page object has one handle.
     bool strictlyEquals(const Value& other) const;
+
+    // == and std::hash follow JavaScript Map keys (SameValueZero): like ===, except that
+    // NaN equals NaN. So a Value can key an unordered_map, for example by element.
+    friend bool operator==(const Value& a, const Value& b) noexcept;
+    std::size_t hash() const noexcept;
 
 private:
     enum class Kind { Undefined, Null, Bool, Number, String, Handle };
@@ -461,7 +476,45 @@ private:
     std::shared_ptr<detail::Handle> handle_;
 };
 
+// A C++ function that JavaScript can call, made by js::function. It works for as long
+// as you hold it: copies share it, and when the last copy is destroyed the C++ function
+// is released (calling it from JavaScript then throws). Pass it to JavaScript by name,
+// from a variable that lives as long as JavaScript may call it:
+//
+//     onClick = volt2::js::function([] { ... });   // a member, say
+//     button.call("addEventListener", "click", onClick);
+class Function {
+public:
+    Function() = default;  // empty
+    // The JavaScript function, or undefined when empty.
+    const Value& value() const;
+    explicit operator bool() const { return owner_ != nullptr; }
+
+private:
+    struct Owner;
+    explicit Function(std::shared_ptr<Owner> owner) : owner_(std::move(owner)) {}
+    friend Function detail::makeFunction(detail::Callback);
+
+    std::shared_ptr<Owner> owner_;
+};
+
+struct Function::Owner {
+    long long id;
+    unsigned long long generation;
+    Value wrapper;
+    Owner(long long i, unsigned long long g, Value w) : id(i), generation(g), wrapper(std::move(w)) {}
+    Owner(const Owner&) = delete;
+    Owner& operator=(const Owner&) = delete;
+    ~Owner();
+};
+
 }  // namespace js
+
+// What C++ currently holds of the page. Useful for finding leaks.
+struct Stats {
+    std::size_t values = 0;     // distinct JavaScript objects held through js::Values
+    std::size_t functions = 0;  // live js::Functions (C++ functions JavaScript can call)
+};
 
 // ============================================================================
 // Runtime state and the call dispatch shared by both builds
@@ -484,8 +537,6 @@ struct Options {
 
 namespace detail {
 
-using Callback = std::function<js::Value(const js::Args&)>;
-
 // How operations reach the page: synchronous HTTP in development, a direct call in WebAssembly.
 struct Transport {
     virtual ~Transport() = default;
@@ -498,10 +549,22 @@ struct PageReplaced {};
 
 struct Runtime {
     Transport* transport = nullptr;
+    std::thread::id thread;             // the thread running volt2::run; only it may touch the page
     unsigned long long generation = 1;  // bumped on every page load
     std::vector<long long> releases;    // handles to release, sent with the next message
+    std::unordered_map<long long, std::weak_ptr<Handle>> live;  // the one Handle per page object
     long long nextCallback = 1;
     std::unordered_map<long long, std::shared_ptr<Callback>> callbacks;
+    std::size_t warnAt = 10000;  // development leak warnings, see VOLT2_WARN_AT
+    std::size_t warnValuesAt = 10000;
+    std::size_t warnFunctionsAt = 10000;
+
+    // Values and Functions destroyed on other threads: queued here (id, generation) and
+    // applied on volt2's thread before its next operation or call.
+    std::mutex elsewhereMutex;
+    std::atomic<bool> elsewherePending{false};
+    std::vector<std::pair<long long, unsigned long long>> releasedElsewhere;
+    std::vector<std::pair<long long, unsigned long long>> functionsDroppedElsewhere;
 };
 
 // Never destroyed, so Values that outlive main cannot touch a dead runtime.
@@ -510,9 +573,73 @@ inline Runtime& runtime() {
     return *instance;
 }
 
-inline Handle::~Handle() {
+inline void logError(const std::string& message) {
+    std::fprintf(stderr, "volt2: %s\n", message.c_str());
+    std::fflush(stderr);
+}
+
+inline bool onVoltThread() { return std::this_thread::get_id() == runtime().thread; }
+
+inline void requireVoltThread() {
+    if (!onVoltThread()) {
+        throw js::Error("volt2: JavaScript values can only be used on the thread that called volt2::run");
+    }
+}
+
+// The runtime is not thread-safe, so a Value or Function destroyed on another thread only
+// queues its release; volt2's thread applies it (see settleElsewhere).
+inline void queueElsewhere(std::vector<std::pair<long long, unsigned long long>> Runtime::*queue, long long id,
+                           unsigned long long generation) {
     Runtime& r = runtime();
-    if (generation == r.generation) r.releases.push_back(id);
+    {
+        std::lock_guard<std::mutex> lock(r.elsewhereMutex);
+        (r.*queue).emplace_back(id, generation);
+    }
+    r.elsewherePending.store(true, std::memory_order_release);
+}
+
+inline void releaseHandle(long long id, unsigned long long generation) {
+    Runtime& r = runtime();
+    if (generation != r.generation) return;  // that page is gone, and its table with it
+    r.releases.push_back(id);
+    auto slot = r.live.find(id);
+    if (slot != r.live.end() && slot->second.expired()) r.live.erase(slot);
+}
+
+inline Handle::~Handle() {
+    if (onVoltThread()) releaseHandle(id, generation);
+    else queueElsewhere(&Runtime::releasedElsewhere, id, generation);
+}
+
+// On volt2's thread: apply releases queued by other threads. Functions first, so a
+// function destroyed elsewhere can never be called again, even if its lambda pointed
+// at memory that is gone now.
+inline void settleElsewhere() {
+    Runtime& r = runtime();
+    if (!r.elsewherePending.exchange(false, std::memory_order_acquire)) return;
+    std::vector<std::pair<long long, unsigned long long>> handles, functions;
+    {
+        std::lock_guard<std::mutex> lock(r.elsewhereMutex);
+        handles.swap(r.releasedElsewhere);
+        functions.swap(r.functionsDroppedElsewhere);
+    }
+    for (auto [id, generation] : functions) {
+        if (generation == r.generation) r.callbacks.erase(id);
+    }
+    for (auto [id, generation] : handles) releaseHandle(id, generation);
+}
+
+// The Handle for a page object, shared by every Value that refers to it.
+inline std::shared_ptr<Handle> intern(long long id) {
+    Runtime& r = runtime();
+    std::weak_ptr<Handle>& slot = r.live[id];
+    if (std::shared_ptr<Handle> existing = slot.lock()) return existing;
+    auto handle = std::make_shared<Handle>(id, r.generation);
+    slot = handle;
+    // The page may hand back an object whose release we queued but have not sent yet.
+    // It still has the same id there, so cancel the release.
+    std::erase(r.releases, id);
+    return handle;
 }
 
 inline void attachReleases(Json& message) {
@@ -534,6 +661,8 @@ inline Json op(const char* name) {
 inline Json request(Json op) {
     Runtime& r = runtime();
     if (!r.transport) throw js::Error("volt2: no page is connected. JavaScript is only reachable inside volt2::run.");
+    requireVoltThread();
+    settleElsewhere();
     attachReleases(op);
     Json reply = r.transport->request(op);
     if (const Json* error = reply.find("error")) throw js::Error(error->asString());
@@ -544,6 +673,7 @@ inline Json request(Json op) {
 
 inline Json toWire(const js::Value& value) {
     using Kind = js::Value::Kind;
+    requireVoltThread();  // before touching any shared state
     switch (value.kind_) {
         case Kind::Undefined: { Json j = Json::object(); j.set("u", Json::number(1)); return j; }
         case Kind::Null: return Json();
@@ -569,6 +699,7 @@ inline Json toWire(const js::Value& value) {
 
 inline js::Value fromWire(const Json& wire) {
     using Kind = js::Value::Kind;
+    requireVoltThread();
     js::Value value;
     switch (wire.type()) {
         case Json::Type::Null: value.kind_ = Kind::Null; break;
@@ -578,7 +709,7 @@ inline js::Value fromWire(const Json& wire) {
         case Json::Type::Object:
             if (const Json* h = wire.find("h")) {
                 value.kind_ = Kind::Handle;
-                value.handle_ = std::make_shared<Handle>(static_cast<long long>(h->asNumber()), runtime().generation);
+                value.handle_ = intern(static_cast<long long>(h->asNumber()));
             } else if (const Json* f = wire.find("f")) {
                 const std::string& name = f->asString();
                 value.kind_ = Kind::Number;
@@ -593,8 +724,17 @@ inline js::Value fromWire(const Json& wire) {
 template <js::ToJs T>
 js::Value toValue(T&& x) {
     using D = std::remove_cvref_t<T>;
-    if constexpr (std::same_as<D, js::Value>) return std::forward<T>(x);
-    else if constexpr (std::same_as<D, std::nullptr_t>) return js::Value(nullptr);
+    if constexpr (std::same_as<D, js::Value>) {
+        // A copy, never a move: a temporary argument must keep its handle alive until the
+        // operation using it has reached the page.
+        return js::Value(x);
+    } else if constexpr (std::same_as<D, js::Function>) {
+        static_assert(std::is_lvalue_reference_v<T>,
+                      "volt2: pass a js::Function by name, from a variable that lives as long as JavaScript may "
+                      "call it. A temporary js::Function is released at the end of the statement.");
+        if (!x) throw js::Error("volt2: this js::Function is empty");
+        return x.value();
+    } else if constexpr (std::same_as<D, std::nullptr_t>) return js::Value(nullptr);
     else if constexpr (std::same_as<D, bool>) return js::Value(static_cast<bool>(x));
     else if constexpr (std::is_arithmetic_v<D>) return js::Value(x);
     else return js::Value(std::string(std::forward<T>(x)));
@@ -629,21 +769,55 @@ inline Json errorReply(const std::string& message) {
     return reply;
 }
 
+// Development only: warn when C++ keeps accumulating page values or functions. Each
+// warning doubles the next threshold, so a steady leak keeps reporting but rarely.
+inline void noticeGrowth() {
+#ifndef __EMSCRIPTEN__
+    Runtime& r = runtime();
+    auto check = [&](std::size_t count, std::size_t& next, const char* what) {
+        if (count < next) return;
+        while (next <= count) next *= 2;
+        std::string message = "C++ now holds " + std::to_string(count) + " " + what +
+                              ". If this keeps growing, something keeps js::Values or js::Functions alive longer than intended.";
+        logError(message);
+        try {  // also in the browser console, where web developers look
+            Json find = op("global");
+            find.set("k", Json::string("console"));
+            js::Value console = fromWire(request(std::move(find)));
+            Json warn = op("call");
+            warn.set("o", toWire(console));
+            warn.set("k", Json::string("warn"));
+            Json args = Json::array();
+            args.push(Json::string("volt2: " + message));
+            warn.set("a", std::move(args));
+            request(std::move(warn));
+        } catch (const js::Error&) {
+        }
+    };
+    check(r.live.size(), r.warnValuesAt, "JavaScript values");
+    check(r.callbacks.size(), r.warnFunctionsAt, "C++ functions callable from JavaScript");
+#endif
+}
+
 // Runs the C++ function a page asked for. Exceptions become the reply's error, which
 // the page rethrows as a JavaScript Error in the caller, so nothing unwinds across the bridge.
 inline Json serveCall(const Json& message) {
     Runtime& r = runtime();
+    settleElsewhere();  // before the lookup: a function destroyed elsewhere must not run
     Json reply = returnReply();
     try {
-        const Json* id = message.find("id");
-        auto it = id ? r.callbacks.find(static_cast<long long>(id->asNumber())) : r.callbacks.end();
-        if (it == r.callbacks.end()) throw js::Error("volt2: this C++ function no longer exists");
-        std::shared_ptr<Callback> callback = it->second;  // keeps it alive if the table changes
+        // Arguments first: they hold page objects that must be released even if the call fails.
         js::Args args;
         if (const Json* list = message.find("a")) {
             for (const Json& wire : list->items()) args.push_back(fromWire(wire));
         }
-        reply.set("v", toWire((*callback)(args)));
+        const Json* id = message.find("id");
+        auto it = id ? r.callbacks.find(static_cast<long long>(id->asNumber())) : r.callbacks.end();
+        if (it == r.callbacks.end()) throw js::Error("volt2: this C++ function was released (its js::Function is gone)");
+        std::shared_ptr<Callback> callback = it->second;  // keeps it alive if the table changes
+        js::Value result = (*callback)(args);
+        noticeGrowth();  // may talk to the page, so `result` must still hold its object
+        reply.set("v", toWire(result));
     } catch (const PageReplaced&) {
         throw;
     } catch (const std::exception& e) {
@@ -655,13 +829,21 @@ inline Json serveCall(const Json& message) {
     return reply;
 }
 
-inline js::Value makeFunction(Callback callback) {
+inline js::Function makeFunction(Callback callback) {
+    requireVoltThread();
     Runtime& r = runtime();
     long long id = r.nextCallback++;
     r.callbacks[id] = std::make_shared<Callback>(std::move(callback));
     Json o = op("fn");
     o.set("k", Json::number(static_cast<double>(id)));
-    return fromWire(request(std::move(o)));
+    js::Value wrapper;
+    try {
+        wrapper = fromWire(request(std::move(o)));
+    } catch (...) {
+        r.callbacks.erase(id);
+        throw;
+    }
+    return js::Function(std::make_shared<js::Function::Owner>(id, r.generation, std::move(wrapper)));
 }
 
 template <class G>
@@ -678,17 +860,27 @@ js::Value resultToValue(G&& invoke) {
 
 inline void beginPage() {
     Runtime& r = runtime();
-    ++r.generation;  // first, so values dropped below do not queue releases
+    ++r.generation;  // first, so values and functions dropped below do nothing
     r.callbacks.clear();
     r.releases.clear();
-}
-
-inline void logError(const std::string& message) {
-    std::fprintf(stderr, "volt2: %s\n", message.c_str());
-    std::fflush(stderr);
+    r.live.clear();
+    r.warnValuesAt = r.warnFunctionsAt = r.warnAt;
+    std::lock_guard<std::mutex> lock(r.elsewhereMutex);  // queued releases belong to the old page
+    r.releasedElsewhere.clear();
+    r.functionsDroppedElsewhere.clear();
 }
 
 }  // namespace detail
+
+// Only on the thread that called volt2::run.
+inline Stats stats() {
+    detail::requireVoltThread();
+    detail::settleElsewhere();
+    detail::Runtime& r = detail::runtime();
+    std::size_t values = 0;
+    for (const auto& entry : r.live) values += entry.second.expired() ? 0 : 1;
+    return Stats{values, r.callbacks.size()};
+}
 
 namespace js {
 
@@ -766,19 +958,49 @@ inline std::string Value::typeOf() const {
 }
 
 inline bool Value::strictlyEquals(const Value& other) const {
-    if (kind_ != Kind::Handle && other.kind_ != Kind::Handle) {
-        if (kind_ != other.kind_) return false;
-        switch (kind_) {
-            case Kind::Bool: return bool_ == other.bool_;
-            case Kind::Number: return number_ == other.number_;  // NaN !== NaN, as in JavaScript
-            case Kind::String: return string_ == other.string_;
-            default: return true;  // undefined, null
-        }
+    if (kind_ != other.kind_) return false;
+    switch (kind_) {
+        case Kind::Bool: return bool_ == other.bool_;
+        case Kind::Number: return number_ == other.number_;  // NaN !== NaN, as in JavaScript
+        case Kind::String: return string_ == other.string_;
+        case Kind::Handle: return handle_ == other.handle_;  // one Handle per page object
+        default: return true;                                 // undefined, null
     }
-    detail::Json o = detail::op("eq");
-    o.set("o", detail::toWire(*this));
-    o.set("v", detail::toWire(other));
-    return detail::fromWire(detail::request(std::move(o))).bool_;
+}
+
+inline bool operator==(const Value& a, const Value& b) noexcept {
+    if (a.kind_ == Value::Kind::Number && b.kind_ == Value::Kind::Number && std::isnan(a.number_) && std::isnan(b.number_)) {
+        return true;
+    }
+    return a.strictlyEquals(b);
+}
+
+inline std::size_t Value::hash() const noexcept {
+    switch (kind_) {
+        case Kind::Undefined: return 0x51ed270b;
+        case Kind::Null: return 0x2c1b3c6d;
+        case Kind::Bool: return bool_ ? 0x297a2d39 : 0x4cf5ad43;
+        case Kind::Number:
+            if (std::isnan(number_)) return 0x7ff80000;
+            return std::hash<double>{}(number_ == 0 ? 0.0 : number_);  // +0 and -0 are equal
+        case Kind::String: return std::hash<std::string>{}(string_);
+        case Kind::Handle: return std::hash<const void*>{}(handle_.get());
+    }
+    return 0;
+}
+
+inline const Value& Function::value() const {
+    static const Value undefined;
+    return owner_ ? owner_->wrapper : undefined;
+}
+
+inline Function::Owner::~Owner() {
+    if (!detail::onVoltThread()) {
+        detail::queueElsewhere(&detail::Runtime::functionsDroppedElsewhere, id, generation);
+        return;
+    }
+    detail::Runtime& r = detail::runtime();
+    if (generation == r.generation) r.callbacks.erase(id);
 }
 
 inline double Value::numberValue() const {
@@ -830,10 +1052,10 @@ template <class F>
 concept Callable = TakesArgs<std::decay_t<F>> || TakesFirst<std::decay_t<F>> || TakesNothing<std::decay_t<F>>;
 
 // Wraps a C++ function so JavaScript can call it. It may take (const js::Args&),
-// (const js::Value& first) or nothing, and return void or anything ToJs.
-// The function lives until the page is reloaded.
+// (const js::Value& first) or nothing, and return void or anything ToJs. It works for
+// as long as you hold the returned js::Function.
 template <Callable F>
-Value function(F&& f) {
+[[nodiscard]] Function function(F&& f) {
     using Fn = std::decay_t<F>;
     auto fn = std::make_shared<Fn>(std::forward<F>(f));
     if constexpr (TakesArgs<Fn>) {
@@ -853,6 +1075,14 @@ Value function(F&& f) {
 }
 
 }  // namespace js
+}  // namespace volt2
+
+template <>
+struct std::hash<volt2::js::Value> {
+    std::size_t operator()(const volt2::js::Value& value) const noexcept { return value.hash(); }
+};
+
+namespace volt2 {
 
 // ============================================================================
 // The page client, embedded from web/volt2.js (generated, do not edit by hand)
@@ -868,13 +1098,15 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
 // calls C++ functions through callNative. Values cross as JSON: booleans, finite
 // numbers, strings and null as themselves; undefined as {u:1}; NaN and the
 // infinities as {f:"NaN"}; anything else as {h:id}, a handle that C++ releases
-// when it no longer needs it.
+// when it no longer needs it. An object keeps the same id for as long as C++ holds
+// it, so C++ can compare objects without asking the page.
 //
 // volt2.hpp embeds a copy of this file. After editing it, run tools/embed_js.py.
 (function () {
   'use strict';
 
-  const handles = new Map();
+  const handles = new Map(); // id -> value
+  const idOf = new Map(); // value -> id, for values C++ currently holds
   let nextHandle = 1;
   let transport = null; // (message) => reply; set by startDev or attachWasm
 
@@ -889,8 +1121,12 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
         return Number.isFinite(value) ? value : { f: String(value) };
       default: {
         if (value === null) return null;
-        const id = nextHandle++;
-        handles.set(id, value);
+        let id = idOf.get(value);
+        if (id === undefined) {
+          id = nextHandle++; // never reused, so a released id cannot mean another object
+          handles.set(id, value);
+          idOf.set(value, id);
+        }
         return { h: id };
       }
     }
@@ -908,7 +1144,11 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
   }
 
   function release(ids) {
-    if (ids) for (const id of ids) handles.delete(id);
+    if (!ids) return;
+    for (const id of ids) {
+      if (handles.has(id)) idOf.delete(handles.get(id));
+      handles.delete(id);
+    }
   }
 
   function kind(value) {
@@ -942,8 +1182,6 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
         return Reflect.construct(fromWire(op.o), args);
       case 'typeof':
         return typeof fromWire(op.o);
-      case 'eq':
-        return fromWire(op.o) === fromWire(op.v);
       case 'fn': {
         const id = op.k;
         return function () {
@@ -956,14 +1194,14 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
   }
 
   // Runs one operation for C++. Errors are returned, never thrown across the bridge.
-  // Released handles are dropped afterwards, so a reply may still refer to them.
+  // Releases come first: C++ released those ids before sending, so if the result is one
+  // of those objects it must get a fresh id. (The operation itself never uses them.)
   function exec(op) {
+    release(op.rel);
     try {
       return { v: toWire(perform(op)) };
     } catch (e) {
       return { error: e instanceof Error ? e.name + ': ' + e.message : String(e) };
-    } finally {
-      release(op.rel);
     }
   }
 
@@ -998,6 +1236,7 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
   }
 
   function startDev() {
+    api.mode = 'development';
     const page = Date.now().toString(36) + Math.random().toString(36).slice(2);
     transport = function (message) {
       message.s = page;
@@ -1021,6 +1260,7 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
   }
 
   function attachWasm(dispatch) {
+    api.mode = 'webassembly';
     transport = function (message) {
       return JSON.parse(dispatch(JSON.stringify(message)));
     };
@@ -1030,7 +1270,8 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
     return JSON.stringify(exec(JSON.parse(text)));
   }
 
-  globalThis.volt2 = {
+  const api = {
+    mode: 'not started', // then 'development' or 'webassembly'
     startDev: startDev,
     attachWasm: attachWasm,
     execJson: execJson,
@@ -1038,6 +1279,7 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
       return handles.size;
     },
   };
+  globalThis.volt2 = api;
 })();
 )VOLT2JS",
 };
@@ -1365,6 +1607,7 @@ inline void openBrowser(const std::string& url) {
                 try {
                     Session session;
                     site(session);
+                    noticeGrowth();
                     reply.set("v", toWire(js::Value()));
                 } catch (const PageReplaced&) {
                     throw;
@@ -1412,6 +1655,10 @@ inline int run(Site site, Options options = Options()) {
 
     static Bridge bridge;  // outlives the detached connection threads
     runtime().transport = &bridge;
+    runtime().thread = std::this_thread::get_id();
+    if (std::string warn = environment("VOLT2_WARN_AT"); std::atoi(warn.c_str()) > 0) {
+        runtime().warnAt = static_cast<std::size_t>(std::atoi(warn.c_str()));
+    }
     std::thread([listener] {
         for (;;) {
             net::Socket connection = ::accept(listener, nullptr, nullptr);
@@ -1454,6 +1701,7 @@ inline std::string wasmDispatch(std::string text) {
 // WebAssembly: runs the site once, then returns; the page keeps calling into the module.
 inline int run(Site site, Options = Options()) {
     using namespace detail;
+    runtime().thread = std::this_thread::get_id();
     static bool registered = false;
     if (!registered) {
         emscripten::function("volt2_dispatch", &wasmDispatch);
