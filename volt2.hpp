@@ -12,12 +12,14 @@
 //                       (default 10000; the threshold doubles after each warning)
 #pragma once
 
-#if defined(_MSVC_LANG)
-#  if _MSVC_LANG < 202002L
-#    error "volt2 needs C++20 or newer. In Visual Studio: Project Properties > C/C++ > Language > C++ Language Standard > ISO C++20."
+// volt2 needs C++23: its markup, tag::Div[attr::Id = "x", attr::Class = "y"](...), uses
+// C++23's multidimensional subscript operator, so that is the feature checked here.
+#if !defined(__cpp_multidimensional_subscript)
+#  if defined(_MSC_VER)
+#    error "volt2 needs C++23. In Visual Studio: Project Properties > C/C++ > Language > C++ Language Standard > Preview - ISO C++23 (/std:c++23preview)."
+#  else
+#    error "volt2 needs C++23, for example -std=c++23 (g++ 12+, clang 15+, em++)."
 #  endif
-#elif __cplusplus < 202002L
-#  error "volt2 needs C++20 or newer, for example -std=c++20."
 #endif
 
 #include <charconv>
@@ -31,12 +33,16 @@
 #include <cstring>
 #include <atomic>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <ranges>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -519,15 +525,36 @@ struct Stats {
 // ============================================================================
 // Runtime state and the call dispatch shared by both builds
 // ============================================================================
+namespace detail {
+class Renderer;
+struct Sessions;
+}  // namespace detail
+
+// Your session type derives from this. volt2 creates one per page load and destroys it
+// when that page goes away (reloaded, or replaced by another tab): its constructor is the
+// one-time setup, its members are the page's state, its destructor the cleanup.
 class Session {
 public:
     Session() = default;
+    virtual ~Session() = default;
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
-    // Per-page state lives here in later versions.
+
+    // Renders the page again. Event handlers do this by themselves, except for events
+    // that elements fire on their own (load, error, toggle, media and animation events):
+    // a render recreates those elements, which would fire the event again and loop. Call
+    // it from such a handler when its state changed, or from other C++ that changes state.
+    void invalidate();
+
+private:
+    friend struct detail::Sessions;
+    detail::Renderer* renderer_ = nullptr;
 };
 
-using Site = std::function<void(Session&)>;
+template <class S>
+concept SessionType = std::derived_from<S, Session> && std::default_initializable<S>;
+
+using js::Value;
 
 // For example: volt2::run(site, {.port = 8123, .openBrowser = false});
 struct Options {
@@ -555,6 +582,7 @@ struct Runtime {
     std::unordered_map<long long, std::weak_ptr<Handle>> live;  // the one Handle per page object
     long long nextCallback = 1;
     std::unordered_map<long long, std::shared_ptr<Callback>> callbacks;
+    bool tearingDown = false;    // destroying a gone page's session: JavaScript calls do nothing
     std::size_t warnAt = 10000;  // development leak warnings, see VOLT2_WARN_AT
     std::size_t warnValuesAt = 10000;
     std::size_t warnFunctionsAt = 10000;
@@ -662,6 +690,16 @@ inline Json request(Json op) {
     Runtime& r = runtime();
     if (!r.transport) throw js::Error("volt2: no page is connected. JavaScript is only reachable inside volt2::run.");
     requireVoltThread();
+    if (r.tearingDown) {  // never throw here: we are inside a destructor
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            logError("a session destructor used JavaScript after its page was gone; such calls do nothing.");
+        }
+        Json undefined = Json::object();
+        undefined.set("u", Json::number(1));
+        return undefined;
+    }
     settleElsewhere();
     attachReleases(op);
     Json reply = r.transport->request(op);
@@ -1085,6 +1123,612 @@ struct std::hash<volt2::js::Value> {
 namespace volt2 {
 
 // ============================================================================
+// Markup: tag::Div[attr::Id = "x", event::OnClick(handler)](children...)  (both builds)
+// ============================================================================
+class VirtualNode;
+class Element;
+class Tag;
+
+namespace detail {
+class Renderer;
+struct Children;
+
+// An attribute or an event handler, as made by attr:: and event::.
+struct Prop {
+    enum class Kind { Absent, Attribute, Event };
+    Kind kind = Kind::Absent;  // Absent: a boolean attribute set to false
+    std::string name;          // attribute name, or event type
+    std::string value;
+    std::function<void(const js::Value&)> handler;
+};
+
+// Integers are written exactly; other numbers as JavaScript would show them.
+template <class N>
+std::string numberText(N number) {
+    if constexpr (std::is_integral_v<N>) {
+        return std::to_string(number);
+    } else {
+        double value = static_cast<double>(number);
+        if (std::isfinite(value) && std::trunc(value) == value && std::fabs(value) < 1e15) {
+            return std::to_string(static_cast<long long>(value));
+        }
+        if (!std::isfinite(value)) return std::isnan(value) ? "NaN" : value > 0 ? "Infinity" : "-Infinity";
+        return Json::number(value).dump();
+    }
+}
+
+template <class>
+inline constexpr bool dependentFalse = false;
+
+}  // namespace detail
+
+// A piece of the page: an element, some text, or nothing. VirtualNode() renders nothing,
+// which is handy in conditionals: `open ? tag::P("details") : VirtualNode()`.
+class VirtualNode {
+public:
+    VirtualNode() = default;
+    bool isNothing() const { return kind_ == Kind::Nothing; }
+
+private:
+    friend class Element;
+    friend class detail::Renderer;
+    friend struct detail::Children;
+
+    enum class Kind { Nothing, Text, Element };
+    Kind kind_ = Kind::Nothing;
+    std::string name_;  // the tag name, or the text
+    std::vector<detail::Prop> props_;
+    std::vector<VirtualNode> children_;
+};
+
+// Nothing, wherever a prop or a node can go, so conditionals type-check:
+//     tag::Input[s.locked ? attr::ReadOnly = true : None]()
+//     tag::Span[s.tip.empty() ? None : attr::Title = s.tip]()
+//     s.open ? tag::P("details") : None
+struct NoneType {
+    explicit constexpr NoneType(int) {}  // like std::nullopt_t: only volt2::None
+    operator detail::Prop() const { return {}; }
+    operator VirtualNode() const { return {}; }
+};
+inline constexpr NoneType None{0};
+
+namespace detail {
+
+template <class T>
+concept NodeChild = std::convertible_to<T, VirtualNode>;
+template <class T>
+concept TextChild = std::convertible_to<T, std::string_view>;
+template <class T>
+concept NumberChild = std::is_arithmetic_v<std::remove_cvref_t<T>> && !std::same_as<std::remove_cvref_t<T>, bool> &&
+                      !std::same_as<std::remove_cvref_t<T>, char>;
+template <class T>
+concept OptionalChild = std::same_as<std::remove_cvref_t<T>, std::optional<VirtualNode>>;
+template <class T>
+concept RangeChild = std::ranges::input_range<T> && !TextChild<T> &&
+                     std::convertible_to<std::ranges::range_reference_t<T>, VirtualNode>;
+
+struct Children {
+    static VirtualNode text(std::string text) {
+        VirtualNode node;
+        node.kind_ = VirtualNode::Kind::Text;
+        node.name_ = std::move(text);
+        return node;
+    }
+    static VirtualNode element(std::string_view name, std::vector<Prop> props) {
+        VirtualNode node;
+        node.kind_ = VirtualNode::Kind::Element;
+        node.name_ = std::string(name);
+        node.props_ = std::move(props);
+        return node;
+    }
+    template <class T>
+    static void append(std::vector<VirtualNode>& out, T&& child) {
+        if constexpr (NodeChild<T>) {
+            VirtualNode node(std::forward<T>(child));
+            if (!node.isNothing()) out.push_back(std::move(node));
+        } else if constexpr (TextChild<T>) {
+            if constexpr (std::is_pointer_v<std::remove_cvref_t<T>>) {  // a pointer, not a string literal
+                if (child == nullptr) return;                                 // a null const char* is nothing, like None
+            }
+            out.push_back(text(std::string(std::string_view(child))));
+        } else if constexpr (NumberChild<T>) {
+            out.push_back(text(numberText(std::remove_cvref_t<T>(child))));
+        } else if constexpr (OptionalChild<T>) {
+            if (child) append(out, *std::forward<T>(child));
+        } else {
+            for (auto&& item : child) append(out, VirtualNode(std::forward<decltype(item)>(item)));
+        }
+    }
+    static std::vector<VirtualNode>& children(VirtualNode& node) { return node.children_; }
+};
+
+}  // namespace detail
+
+// What can go between the parentheses: nodes, text, numbers, std::optional<VirtualNode>,
+// and ranges of nodes (a std::vector, or a view such as std::views::transform).
+template <class T>
+concept Child = detail::NodeChild<T> || detail::TextChild<T> || detail::NumberChild<T> || detail::OptionalChild<T> ||
+                detail::RangeChild<T>;
+
+// What can go between the brackets: attr:: and event:: props, or None.
+template <class T>
+concept PropLike = std::same_as<std::remove_cvref_t<T>, detail::Prop> || std::same_as<std::remove_cvref_t<T>, NoneType>;
+
+// A tag with its props, waiting for its children: what tag::Div[...] returns.
+class Element {
+public:
+    template <Child... C>
+    VirtualNode operator()(C&&... children) const& {
+        return build(props_, std::forward<C>(children)...);
+    }
+    template <Child... C>
+    VirtualNode operator()(C&&... children) && {
+        return build(std::move(props_), std::forward<C>(children)...);
+    }
+
+private:
+    friend class Tag;
+    Element(std::string_view name, std::vector<detail::Prop> props) : name_(name), props_(std::move(props)) {}
+
+    template <class... C>
+    VirtualNode build(std::vector<detail::Prop> props, C&&... children) const {
+        VirtualNode node = detail::Children::element(name_, std::move(props));
+        auto& list = detail::Children::children(node);
+        (detail::Children::append(list, std::forward<C>(children)), ...);
+        return node;
+    }
+
+    std::string_view name_;
+    std::vector<detail::Prop> props_;
+};
+
+// An HTML element: tag::P("text") or tag::P[props...](children...). Define your own with
+// `inline constexpr volt2::Tag MyWidget{"my-widget"};`.
+class Tag {
+public:
+    constexpr explicit Tag(std::string_view name) : name_(name) {}
+
+    template <PropLike... P>
+    Element operator[](P&&... props) const {
+        std::vector<detail::Prop> list;
+        list.reserve(sizeof...(P));
+        auto keep = [&](detail::Prop prop) {
+            if (prop.kind != detail::Prop::Kind::Absent) list.push_back(std::move(prop));
+        };
+        (keep(std::forward<P>(props)), ...);
+        return Element(name_, std::move(list));
+    }
+
+    template <Child... C>
+    VirtualNode operator()(C&&... children) const {
+        return Element(name_, {})(std::forward<C>(children)...);
+    }
+
+    constexpr std::string_view name() const { return name_; }
+
+private:
+    std::string_view name_;
+};
+
+// How an attribute writes `= true` and `= false`.
+enum class Booleans {
+    None,       // not a boolean: `= true` is a compile error
+    Presence,   // HTML boolean attributes: true writes it (as ""), false leaves it out
+    TrueFalse,  // draggable, spellcheck, contenteditable, aria-*, data-*: "true" or "false"
+};
+
+// An attribute: attr::Id = "main", attr::Disabled = true, attr::TabIndex = 3.
+template <class Name, Booleans Bools = Booleans::None>
+class BasicAttribute {
+public:
+    constexpr explicit BasicAttribute(Name name) : name_(std::move(name)) {}
+
+    detail::Prop operator=(std::string_view value) const {
+        return {detail::Prop::Kind::Attribute, std::string(name_), std::string(value), {}};
+    }
+    // A null const char* leaves the attribute out, like None.
+    detail::Prop operator=(const char* value) const {
+        if (value == nullptr) return {};
+        return *this = std::string_view(value);
+    }
+    // An empty std::optional leaves the attribute out: attr::Title = s.tooltip.
+    template <class T>
+        requires(std::convertible_to<const T&, std::string_view> || std::is_arithmetic_v<T>)
+    detail::Prop operator=(const std::optional<T>& value) const {
+        if (!value) return {};
+        return *this = *value;
+    }
+    template <std::same_as<bool> B>
+    detail::Prop operator=(B value) const {
+        if constexpr (Bools == Booleans::Presence) {
+            if (!value) return {};
+            return {detail::Prop::Kind::Attribute, std::string(name_), std::string(), {}};
+        } else if constexpr (Bools == Booleans::TrueFalse) {
+            return {detail::Prop::Kind::Attribute, std::string(name_), value ? "true" : "false", {}};
+        } else {
+            static_assert(detail::dependentFalse<B>,
+                          "volt2: this attribute does not take true/false. Write the value as a string: \"\" for a "
+                          "present boolean attribute, or \"true\"/\"false\" if that is what the attribute expects.");
+            return {};
+        }
+    }
+    template <class N>
+        requires(std::is_arithmetic_v<N> && !std::same_as<N, bool> && !std::same_as<N, char>)
+    detail::Prop operator=(N number) const {
+        return {detail::Prop::Kind::Attribute, std::string(name_), detail::numberText(number), {}};
+    }
+
+private:
+    Name name_;
+};
+
+using AttributeName = BasicAttribute<std::string_view>;
+using BooleanAttribute = BasicAttribute<std::string_view, Booleans::Presence>;
+using TrueFalseAttribute = BasicAttribute<std::string_view, Booleans::TrueFalse>;
+
+// Element names, PascalCase so names like Template and Object need no underscores.
+namespace tag {
+inline constexpr Tag A{"a"}, Abbr{"abbr"}, Address{"address"}, Area{"area"}, Article{"article"}, Aside{"aside"},
+    Audio{"audio"}, B{"b"}, Bdi{"bdi"}, Bdo{"bdo"}, Blockquote{"blockquote"}, Br{"br"}, Button{"button"},
+    Canvas{"canvas"}, Caption{"caption"}, Cite{"cite"}, Code{"code"}, Col{"col"}, Colgroup{"colgroup"}, Data{"data"},
+    Datalist{"datalist"}, Dd{"dd"}, Del{"del"}, Details{"details"}, Dfn{"dfn"}, Dialog{"dialog"}, Div{"div"}, Dl{"dl"},
+    Dt{"dt"}, Em{"em"}, Embed{"embed"}, Fieldset{"fieldset"}, Figcaption{"figcaption"}, Figure{"figure"},
+    Footer{"footer"}, Form{"form"}, H1{"h1"}, H2{"h2"}, H3{"h3"}, H4{"h4"}, H5{"h5"}, H6{"h6"}, Header{"header"},
+    Hgroup{"hgroup"}, Hr{"hr"}, I{"i"}, Iframe{"iframe"}, Img{"img"}, Input{"input"}, Ins{"ins"}, Kbd{"kbd"},
+    Label{"label"}, Legend{"legend"}, Li{"li"}, Main{"main"}, Map{"map"}, Mark{"mark"}, Menu{"menu"}, Meter{"meter"},
+    Nav{"nav"}, Object{"object"}, Ol{"ol"}, Optgroup{"optgroup"}, Option{"option"}, Output{"output"}, P{"p"},
+    Picture{"picture"}, Pre{"pre"}, Progress{"progress"}, Q{"q"}, Rp{"rp"}, Rt{"rt"}, Ruby{"ruby"}, S{"s"},
+    Samp{"samp"}, Search{"search"}, Section{"section"}, Select{"select"}, Slot{"slot"}, Small{"small"},
+    Source{"source"}, Span{"span"}, Strong{"strong"}, Style{"style"}, Sub{"sub"}, Summary{"summary"}, Sup{"sup"},
+    Table{"table"}, Tbody{"tbody"}, Td{"td"}, Template{"template"}, Textarea{"textarea"}, Tfoot{"tfoot"}, Th{"th"},
+    Thead{"thead"}, Time{"time"}, Tr{"tr"}, Track{"track"}, U{"u"}, Ul{"ul"}, Var{"var"}, Video{"video"},
+    Wbr{"wbr"};
+}  // namespace tag
+
+// Attribute names. attr::Data("id") is data-id, attr::Aria("label") is aria-label, and
+// attr::Named("x") is any other attribute.
+namespace attr {
+// HTML boolean attributes: `= true` writes them, `= false` leaves them out.
+inline constexpr BooleanAttribute AutoFocus{"autofocus"}, AutoPlay{"autoplay"}, Checked{"checked"},
+    Controls{"controls"}, Default{"default"}, Disabled{"disabled"}, Hidden{"hidden"}, Loop{"loop"},
+    Multiple{"multiple"}, Muted{"muted"}, NoValidate{"novalidate"}, Open{"open"}, ReadOnly{"readonly"},
+    Required{"required"}, Reversed{"reversed"}, Selected{"selected"};
+// Attributes whose value is the word "true" or "false".
+inline constexpr TrueFalseAttribute ContentEditable{"contenteditable"}, Draggable{"draggable"},
+    SpellCheck{"spellcheck"};
+// Everything else takes strings and numbers.
+inline constexpr AttributeName Accept{"accept"}, AccessKey{"accesskey"}, Action{"action"}, Alt{"alt"},
+    AutoComplete{"autocomplete"}, Cite{"cite"}, Class{"class"}, Cols{"cols"}, ColSpan{"colspan"}, Content{"content"},
+    CrossOrigin{"crossorigin"}, DateTime{"datetime"}, Dir{"dir"}, Download{"download"}, EncType{"enctype"},
+    For{"for"}, Form{"form"}, Headers{"headers"}, Height{"height"}, High{"high"}, Href{"href"},
+    HrefLang{"hreflang"}, Id{"id"}, InputMode{"inputmode"}, Kind{"kind"}, Label{"label"}, Lang{"lang"},
+    List{"list"}, Loading{"loading"}, Low{"low"}, Max{"max"}, MaxLength{"maxlength"}, Media{"media"},
+    Method{"method"}, Min{"min"}, MinLength{"minlength"}, Name{"name"}, Optimum{"optimum"}, Pattern{"pattern"},
+    Placeholder{"placeholder"}, Poster{"poster"}, Preload{"preload"}, Rel{"rel"}, Role{"role"}, Rows{"rows"},
+    RowSpan{"rowspan"}, Sandbox{"sandbox"}, Scope{"scope"}, Size{"size"}, Sizes{"sizes"}, Span{"span"},
+    Src{"src"}, SrcDoc{"srcdoc"}, SrcLang{"srclang"}, SrcSet{"srcset"}, Start{"start"}, Step{"step"},
+    Style{"style"}, TabIndex{"tabindex"}, Target{"target"}, Title{"title"}, Translate{"translate"}, Type{"type"},
+    Value{"value"}, Width{"width"}, Wrap{"wrap"};
+
+inline BasicAttribute<std::string> Named(std::string_view name) { return BasicAttribute<std::string>(std::string(name)); }
+// data-* and aria-* write `= true` and `= false` as "true" and "false".
+inline BasicAttribute<std::string, Booleans::TrueFalse> Data(std::string_view key) {
+    return BasicAttribute<std::string, Booleans::TrueFalse>("data-" + std::string(key));
+}
+inline BasicAttribute<std::string, Booleans::TrueFalse> Aria(std::string_view key) {
+    return BasicAttribute<std::string, Booleans::TrueFalse>("aria-" + std::string(key));
+}
+}  // namespace attr
+
+// Event handlers: event::OnClick(handler). A handler takes the event (const Value&) or
+// nothing; the event's currentTarget is the handler's own element. After a handler runs,
+// volt2 renders the page again, except after events the elements fire on their own
+// (see Session::invalidate).
+namespace event {
+template <class F>
+concept Handler = std::invocable<F&, const js::Value&> || std::invocable<F&>;
+
+// Any event type: event::On("my-event", handler).
+template <Handler F>
+detail::Prop On(std::string type, F&& handler) {
+    detail::Prop prop;
+    prop.kind = detail::Prop::Kind::Event;
+    prop.name = std::move(type);
+    if constexpr (std::invocable<F&, const js::Value&>) {
+        prop.handler = std::forward<F>(handler);
+    } else {
+        prop.handler = [run = std::forward<F>(handler)](const js::Value&) mutable { run(); };
+    }
+    return prop;
+}
+
+#define VOLT2_EVENT(Name, type)                    \
+    template <Handler F>                           \
+    detail::Prop Name(F&& handler) {               \
+        return On(type, std::forward<F>(handler)); \
+    }
+VOLT2_EVENT(OnClick, "click")
+VOLT2_EVENT(OnDoubleClick, "dblclick")
+VOLT2_EVENT(OnContextMenu, "contextmenu")
+VOLT2_EVENT(OnMouseDown, "mousedown")
+VOLT2_EVENT(OnMouseUp, "mouseup")
+VOLT2_EVENT(OnMouseMove, "mousemove")
+VOLT2_EVENT(OnMouseOver, "mouseover")
+VOLT2_EVENT(OnMouseOut, "mouseout")
+VOLT2_EVENT(OnMouseEnter, "mouseenter")
+VOLT2_EVENT(OnMouseLeave, "mouseleave")
+VOLT2_EVENT(OnPointerDown, "pointerdown")
+VOLT2_EVENT(OnPointerUp, "pointerup")
+VOLT2_EVENT(OnPointerMove, "pointermove")
+VOLT2_EVENT(OnPointerEnter, "pointerenter")
+VOLT2_EVENT(OnPointerLeave, "pointerleave")
+VOLT2_EVENT(OnPointerCancel, "pointercancel")
+VOLT2_EVENT(OnTouchStart, "touchstart")
+VOLT2_EVENT(OnTouchMove, "touchmove")
+VOLT2_EVENT(OnTouchEnd, "touchend")
+VOLT2_EVENT(OnKeyDown, "keydown")
+VOLT2_EVENT(OnKeyUp, "keyup")
+VOLT2_EVENT(OnInput, "input")
+VOLT2_EVENT(OnChange, "change")
+VOLT2_EVENT(OnSubmit, "submit")
+VOLT2_EVENT(OnReset, "reset")
+VOLT2_EVENT(OnInvalid, "invalid")
+VOLT2_EVENT(OnFocus, "focus")
+VOLT2_EVENT(OnBlur, "blur")
+VOLT2_EVENT(OnFocusIn, "focusin")
+VOLT2_EVENT(OnFocusOut, "focusout")
+VOLT2_EVENT(OnScroll, "scroll")
+VOLT2_EVENT(OnWheel, "wheel")
+VOLT2_EVENT(OnDrag, "drag")
+VOLT2_EVENT(OnDragStart, "dragstart")
+VOLT2_EVENT(OnDragEnd, "dragend")
+VOLT2_EVENT(OnDragEnter, "dragenter")
+VOLT2_EVENT(OnDragLeave, "dragleave")
+VOLT2_EVENT(OnDragOver, "dragover")
+VOLT2_EVENT(OnDrop, "drop")
+VOLT2_EVENT(OnCopy, "copy")
+VOLT2_EVENT(OnCut, "cut")
+VOLT2_EVENT(OnPaste, "paste")
+VOLT2_EVENT(OnLoad, "load")
+VOLT2_EVENT(OnError, "error")
+VOLT2_EVENT(OnPlay, "play")
+VOLT2_EVENT(OnPause, "pause")
+VOLT2_EVENT(OnEnded, "ended")
+VOLT2_EVENT(OnTimeUpdate, "timeupdate")
+VOLT2_EVENT(OnVolumeChange, "volumechange")
+VOLT2_EVENT(OnToggle, "toggle")
+VOLT2_EVENT(OnAnimationEnd, "animationend")
+VOLT2_EVENT(OnTransitionEnd, "transitionend")
+#undef VOLT2_EVENT
+}  // namespace event
+
+// ============================================================================
+// Rendering and the page lifecycle (both builds)
+// ============================================================================
+namespace detail {
+
+// Renders a site's tree into the page, and runs its event handlers. This version
+// rebuilds the page's elements on every render: no identity preservation yet.
+class Renderer {
+public:
+    explicit Renderer(std::function<VirtualNode()> render) : render_(std::move(render)) {}
+
+    void start() {
+        dispatcher_ = js::function([this](const js::Args& args) { dispatch(args); });
+        renderNow();
+    }
+
+    // Session::invalidate.
+    void invalidate() {
+        if (rendering_) return;  // the render in progress already shows the latest state
+        if (depth_ > 0) {        // handlers are running: render once, when they finish
+            pending_ = true;
+            return;
+        }
+        renderNow();
+    }
+
+private:
+    // Events that elements fire by themselves. A render recreates the elements (no
+    // identity preservation yet), which would fire these again: rendering after them
+    // automatically would loop, so they render only through Session::invalidate.
+    static bool firedByElement(std::string_view type) {
+        static constexpr std::string_view types[] = {
+            "load", "error", "abort", "toggle", "beforetoggle", "animationstart", "animationend", "animationiteration",
+            "animationcancel", "transitionrun", "transitionstart", "transitionend", "transitioncancel", "loadstart",
+            "loadeddata", "loadedmetadata", "canplay", "canplaythrough", "durationchange", "emptied", "ended", "pause",
+            "play", "playing", "progress", "ratechange", "seeked", "seeking", "stalled", "suspend", "timeupdate",
+            "volumechange", "waiting"};
+        for (std::string_view known : types) {
+            if (known == type) return true;
+        }
+        return false;
+    }
+
+    // One message per render: the whole tree as JSON; volt2.js builds the elements.
+    void renderNow() {
+        rendering_ = true;
+        pending_ = false;
+        struct Done {
+            bool& flag;
+            ~Done() { flag = false; }
+        } done{rendering_};
+        VirtualNode next = render_();
+        current_ = std::move(next);  // the previous tree goes only now, after its handlers ran
+        withHandlers_.clear();
+        Json render = op("render");
+        render.set("k", current_.isNothing() ? Json() : serialize(current_));
+        render.set("f", toWire(dispatcher_.value()));
+        request(std::move(render));
+    }
+
+    Json serialize(const VirtualNode& node) {
+        if (node.kind_ == VirtualNode::Kind::Text) return Json::string(node.name_);
+        Json element = Json::object();
+        element.set("t", Json::string(node.name_));
+        Json attributes = Json::array();
+        Json events = Json::array();
+        for (const Prop& prop : node.props_) {
+            if (prop.kind == Prop::Kind::Attribute) {
+                Json pair = Json::array();
+                pair.push(Json::string(prop.name));
+                pair.push(Json::string(prop.value));
+                attributes.push(std::move(pair));
+            } else if (prop.kind == Prop::Kind::Event) {
+                bool seen = false;
+                for (const Json& type : events.items()) seen = seen || type.asString() == prop.name;
+                if (!seen) events.push(Json::string(prop.name));
+            }
+        }
+        element.set("a", std::move(attributes));
+        if (!events.items().empty()) {
+            element.set("i", Json::number(static_cast<double>(withHandlers_.size())));
+            withHandlers_.push_back(&node);
+            element.set("e", std::move(events));
+        }
+        Json children = Json::array();
+        for (const VirtualNode& child : node.children_) children.push(serialize(child));
+        element.set("c", std::move(children));
+        return element;
+    }
+
+    // Called by volt2.js with the elements that have handlers for this event, from the
+    // target upward, and for each one a view of the event whose currentTarget is that
+    // element. Handlers run first, then the page renders once. A handler that makes
+    // another event fire (element.call("click")) runs that one too, on the same tree,
+    // and the render still happens once, at the end.
+    void dispatch(const js::Args& args) {
+        Json chain = Json::parse(args.at(0).as<std::string>());
+        const std::string type = args.at(1).as<std::string>();
+        if (!firedByElement(type)) pending_ = true;
+        ++depth_;
+        std::exception_ptr failure;
+        try {
+            const auto& indices = chain.items();
+            for (std::size_t n = 0; n < indices.size() && n + 2 < args.size(); ++n) {
+                auto index = static_cast<std::size_t>(indices[n].asNumber());
+                if (index >= withHandlers_.size()) break;
+                const js::Value& event = args[n + 2];
+                for (const Prop& prop : withHandlers_[index]->props_) {
+                    if (prop.kind == Prop::Kind::Event && prop.name == type) prop.handler(event);
+                }
+                if (n + 1 < indices.size() && event["cancelBubble"].as<bool>()) break;  // stopPropagation()
+            }
+        } catch (const PageReplaced&) {
+            --depth_;
+            throw;
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        if (--depth_ == 0 && pending_) renderNow();  // also after a failing handler, to show what changed
+        if (failure) std::rethrow_exception(failure);
+    }
+
+    std::function<VirtualNode()> render_;
+    js::Function dispatcher_;
+    VirtualNode current_;
+    std::vector<const VirtualNode*> withHandlers_;  // index in the JSON -> node in current_
+    int depth_ = 0;
+    bool pending_ = false;    // a render is due when the handlers finish
+    bool rendering_ = false;
+};
+
+struct Sessions {
+    static void attach(Session& session, Renderer* renderer) { session.renderer_ = renderer; }
+    static Renderer* renderer(const Session& session) { return session.renderer_; }
+};
+
+// How to start a site, built by run() from your session type and functions.
+struct SiteDefinition {
+    std::function<std::unique_ptr<Session>()> create;
+    std::function<void(Session&)> start;          // a site built by hand
+    std::function<VirtualNode(Session&)> render;  // a rendered site
+};
+
+// What one page load owns. The renderer goes first: it calls into the session.
+struct Page {
+    std::unique_ptr<Session> session;
+    std::unique_ptr<Renderer> renderer;
+};
+
+inline std::unique_ptr<Page>& currentPage() {
+    static auto* page = new std::unique_ptr<Page>();
+    return *page;
+}
+
+// Destroys a page whose browser page is gone. Its session's destructor may still try
+// JavaScript; such calls do nothing instead of reaching the next page.
+inline void discardPage(std::unique_ptr<Page> page) {
+    Runtime& r = runtime();
+    r.tearingDown = true;
+    page.reset();
+    r.tearingDown = false;
+}
+
+inline void endPage() { discardPage(std::move(currentPage())); }
+
+inline void startPage(const SiteDefinition& site) {
+    auto page = std::make_unique<Page>();
+    try {
+        page->session = site.create();  // your constructor
+        if (site.render) {
+            page->renderer = std::make_unique<Renderer>([&session = *page->session, render = site.render] {
+                return render(session);
+            });
+            Sessions::attach(*page->session, page->renderer.get());
+            page->renderer->start();
+        } else if (site.start) {
+            site.start(*page->session);
+        }
+    } catch (...) {
+        discardPage(std::move(page));
+        throw;
+    }
+    currentPage() = std::move(page);
+}
+
+// Implemented by each backend: development serves the site, WebAssembly starts it.
+inline int runSite(SiteDefinition site, Options options);
+
+}  // namespace detail
+
+inline void Session::invalidate() {
+    detail::requireVoltThread();
+    if (renderer_) renderer_->invalidate();
+}
+
+// A rendered site. volt2 creates your session (one per page load), calls render to get
+// the page, and calls it again after every event handler:
+//
+//     struct Counter : volt2::Session { int count = 0; };
+//     volt2::VirtualNode site(Counter& s) { ... }
+//     int main() { return volt2::run(site); }
+template <SessionType S>
+int run(VirtualNode (*render)(S&), Options options = {}) {
+    detail::SiteDefinition site;
+    site.create = [] { return std::unique_ptr<Session>(std::make_unique<S>()); };
+    site.render = [render](Session& session) { return render(static_cast<S&>(session)); };
+    return detail::runSite(std::move(site), options);
+}
+
+// A site built by hand with js::Value: start runs once per page load, after your constructor.
+template <SessionType S>
+int run(void (*start)(S&), Options options = {}) {
+    detail::SiteDefinition site;
+    site.create = [] { return std::unique_ptr<Session>(std::make_unique<S>()); };
+    site.start = [start](Session& session) { start(static_cast<S&>(session)); };
+    return detail::runSite(std::move(site), options);
+}
+
+// A site built by hand entirely in your session's constructor: volt2::run<MyPage>().
+template <SessionType S>
+int run(Options options = {}) {
+    detail::SiteDefinition site;
+    site.create = [] { return std::unique_ptr<Session>(std::make_unique<S>()); };
+    return detail::runSite(std::move(site), options);
+}
+
+// ============================================================================
 // The page client, embedded from web/volt2.js (generated, do not edit by hand)
 // ============================================================================
 namespace detail {
@@ -1182,6 +1826,8 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
         return Reflect.construct(fromWire(op.o), args);
       case 'typeof':
         return typeof fromWire(op.o);
+      case 'render':
+        return render(op.k, fromWire(op.f));
       case 'fn': {
         const id = op.k;
         return function () {
@@ -1191,6 +1837,87 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
       default:
         throw new Error('volt2: unknown operation ' + op.op);
     }
+  }
+
+  // Rendering. C++ sends the whole tree (no identity preservation yet) and this builds
+  // the elements into #volt2, created at the end of <body> if the page has none. Tree
+  // nodes are strings (text) or {t: tag, a: [[name, value]...], c: [children], and for
+  // elements with handlers i: index, e: [event types]}. One capturing listener per event
+  // type on the mount sends C++ the indices of the elements with handlers for that event,
+  // from the target upward (only the target when the event does not bubble).
+  const mounts = new WeakMap(); // mount element -> { nodes, types, dispatch }
+
+  function mountElement() {
+    let mount = document.getElementById('volt2');
+    if (!mount) {
+      mount = document.createElement('div');
+      mount.id = 'volt2';
+      document.body.appendChild(mount);
+    }
+    return mount;
+  }
+
+  function build(node, state, mount) {
+    if (typeof node === 'string') return document.createTextNode(node);
+    const element = document.createElement(node.t);
+    for (const pair of node.a) element.setAttribute(pair[0], pair[1]);
+    if (node.e) {
+      state.nodes.set(element, { index: node.i, types: node.e });
+      for (const type of node.e) {
+        if (state.types.has(type)) continue;
+        state.types.add(type);
+        mount.addEventListener(type, function (event) { deliver(mount, event); }, true);
+      }
+    }
+    const parent = node.t === 'template' ? element.content : element; // a template's children are its content
+    for (const child of node.c) parent.appendChild(build(child, state, mount));
+    return element;
+  }
+
+  function render(tree, dispatch) {
+    const mount = mountElement();
+    let state = mounts.get(mount);
+    if (!state) {
+      state = { types: new Set() };
+      mounts.set(mount, state);
+    }
+    state.nodes = new WeakMap();
+    state.dispatch = dispatch;
+    const content = document.createDocumentFragment();
+    if (tree !== null) content.appendChild(build(tree, state, mount));
+    mount.replaceChildren(content);
+    return undefined;
+  }
+
+  // The event as one handler sees it: currentTarget is that handler's element (the real
+  // event's is the mount, where the listener is). Everything else, methods included,
+  // goes to the real event.
+  function eventFor(event, element) {
+    return new Proxy(event, {
+      get: function (target, key) {
+        if (key === 'currentTarget') return element;
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+      set: function (target, key, value) {
+        return Reflect.set(target, key, value, target);
+      },
+    });
+  }
+
+  function deliver(mount, event) {
+    const state = mounts.get(mount);
+    const chain = [];
+    const views = [];
+    for (let node = event.target; node && node !== mount; node = node.parentNode) {
+      const info = state.nodes.get(node);
+      if (info && info.types.indexOf(event.type) >= 0) {
+        chain.push(info.index);
+        views.push(eventFor(event, node));
+      }
+      if (!event.bubbles) break;
+    }
+    if (chain.length) state.dispatch.apply(null, [JSON.stringify(chain), event.type].concat(views));
   }
 
   // Runs one operation for C++. Errors are returned, never thrown across the bridge.
@@ -1590,7 +2317,7 @@ inline void openBrowser(const std::string& url) {
 
 // The session loop. It runs on the thread that called volt2::run, so your site
 // and every handler run there too, one at a time, like JavaScript.
-[[noreturn]] inline void serveForever(Bridge& bridge, const Site& site) {
+[[noreturn]] inline void serveForever(Bridge& bridge, const SiteDefinition& site) {
     for (;;) {
         std::shared_ptr<Pending> message = bridge.replacement ? std::move(bridge.replacement) : bridge.next();
         bridge.replacement.reset();
@@ -1602,11 +2329,11 @@ inline void openBrowser(const std::string& url) {
                     bridge.answer(errorReply("volt2: a newer page replaced this one. Reload to continue."));
                     continue;
                 }
-                beginPage();
+                endPage();    // the previous page's session, while its Values are still valid
+                beginPage();  // then forget that page's handles and functions
                 Json reply = returnReply();
                 try {
-                    Session session;
-                    site(session);
+                    startPage(site);
                     noticeGrowth();
                     reply.set("v", toWire(js::Value()));
                 } catch (const PageReplaced&) {
@@ -1629,10 +2356,9 @@ inline void openBrowser(const std::string& url) {
 
 }  // namespace detail
 
-// Development: serves the site and runs it for each page load. Does not return
+// Development: serves the site and starts it for each page load. Does not return
 // unless the server cannot start (then it returns 1).
-inline int run(Site site, Options options = Options()) {
-    using namespace detail;
+inline int detail::runSite(SiteDefinition site, Options options) {
     if (!net::startup()) {
         logError("could not start networking");
         return 1;
@@ -1698,9 +2424,8 @@ inline std::string wasmDispatch(std::string text) {
 
 }  // namespace detail
 
-// WebAssembly: runs the site once, then returns; the page keeps calling into the module.
-inline int run(Site site, Options = Options()) {
-    using namespace detail;
+// WebAssembly: starts the site once, then returns; the page keeps calling into the module.
+inline int detail::runSite(SiteDefinition site, Options) {
     runtime().thread = std::this_thread::get_id();
     static bool registered = false;
     if (!registered) {
@@ -1717,8 +2442,7 @@ inline int run(Site site, Options = Options()) {
     client.call<void>("attachWasm", emscripten::val::module_property("volt2_dispatch"));
     beginPage();
     try {
-        Session session;
-        site(session);
+        startPage(site);
     } catch (const std::exception& e) {
         logError(std::string("your site threw an exception: ") + e.what());
         return 1;

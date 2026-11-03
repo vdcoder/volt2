@@ -90,6 +90,8 @@
         return Reflect.construct(fromWire(op.o), args);
       case 'typeof':
         return typeof fromWire(op.o);
+      case 'render':
+        return render(op.k, fromWire(op.f));
       case 'fn': {
         const id = op.k;
         return function () {
@@ -99,6 +101,87 @@
       default:
         throw new Error('volt2: unknown operation ' + op.op);
     }
+  }
+
+  // Rendering. C++ sends the whole tree (no identity preservation yet) and this builds
+  // the elements into #volt2, created at the end of <body> if the page has none. Tree
+  // nodes are strings (text) or {t: tag, a: [[name, value]...], c: [children], and for
+  // elements with handlers i: index, e: [event types]}. One capturing listener per event
+  // type on the mount sends C++ the indices of the elements with handlers for that event,
+  // from the target upward (only the target when the event does not bubble).
+  const mounts = new WeakMap(); // mount element -> { nodes, types, dispatch }
+
+  function mountElement() {
+    let mount = document.getElementById('volt2');
+    if (!mount) {
+      mount = document.createElement('div');
+      mount.id = 'volt2';
+      document.body.appendChild(mount);
+    }
+    return mount;
+  }
+
+  function build(node, state, mount) {
+    if (typeof node === 'string') return document.createTextNode(node);
+    const element = document.createElement(node.t);
+    for (const pair of node.a) element.setAttribute(pair[0], pair[1]);
+    if (node.e) {
+      state.nodes.set(element, { index: node.i, types: node.e });
+      for (const type of node.e) {
+        if (state.types.has(type)) continue;
+        state.types.add(type);
+        mount.addEventListener(type, function (event) { deliver(mount, event); }, true);
+      }
+    }
+    const parent = node.t === 'template' ? element.content : element; // a template's children are its content
+    for (const child of node.c) parent.appendChild(build(child, state, mount));
+    return element;
+  }
+
+  function render(tree, dispatch) {
+    const mount = mountElement();
+    let state = mounts.get(mount);
+    if (!state) {
+      state = { types: new Set() };
+      mounts.set(mount, state);
+    }
+    state.nodes = new WeakMap();
+    state.dispatch = dispatch;
+    const content = document.createDocumentFragment();
+    if (tree !== null) content.appendChild(build(tree, state, mount));
+    mount.replaceChildren(content);
+    return undefined;
+  }
+
+  // The event as one handler sees it: currentTarget is that handler's element (the real
+  // event's is the mount, where the listener is). Everything else, methods included,
+  // goes to the real event.
+  function eventFor(event, element) {
+    return new Proxy(event, {
+      get: function (target, key) {
+        if (key === 'currentTarget') return element;
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+      set: function (target, key, value) {
+        return Reflect.set(target, key, value, target);
+      },
+    });
+  }
+
+  function deliver(mount, event) {
+    const state = mounts.get(mount);
+    const chain = [];
+    const views = [];
+    for (let node = event.target; node && node !== mount; node = node.parentNode) {
+      const info = state.nodes.get(node);
+      if (info && info.types.indexOf(event.type) >= 0) {
+        chain.push(info.index);
+        views.push(eventFor(event, node));
+      }
+      if (!event.bubbles) break;
+    }
+    if (chain.length) state.dispatch.apply(null, [JSON.stringify(chain), event.type].concat(views));
   }
 
   // Runs one operation for C++. Errors are returned, never thrown across the bridge.
