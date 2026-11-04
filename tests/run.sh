@@ -22,6 +22,7 @@ PROGRAMS=(
     "lifetime tests/lifetime/main.cpp lifetime lifetime"
     "identity tests/identity/main.cpp identity identity"
     "diff tests/diff/main.cpp diff diff"
+    "locals tests/locals/main.cpp locals locals"
 )
 port=8900
 failed=()

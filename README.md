@@ -75,6 +75,8 @@ destroys it when that page goes away (reloaded, or replaced by another tab):
 - its **constructor** is the one-time setup,
 - its **destructor** is the cleanup.
 
+Components can also keep state of their own, see [State inside components](#state-inside-components).
+
 `invalidate()` (a `Session` member) renders the page again. Event handlers do that by themselves;
 call it from C++ that changes state some other way, such as a `js::function` the page calls.
 
@@ -162,7 +164,9 @@ the same place, made it:
   by another branch of a conditional keeps its element too, and a new key starts an element over
   (`tag::Form[attr::Key = s.userId](...)`). volt2 warns in the console when two siblings share a key.
   `Map(items, [](const T& item) { ... })`, which may also take the index, and
-  `Loop(n, [](std::size_t i) { ... })` are Volt's `map` and `loop`.
+  `Loop(n, [](std::size_t i) { ... })` are Volt's `map` and `loop`. `Map(items, key, ...)` takes
+  a key for each item, such as `&Todo::id` or any function of the item, and gives it to the item's
+  element as its `attr::Key`.
 - **Elements stay under their parent.** An element under another parent is another element, so
   moving one there starts it over. To keep an element, such as a playing video, through a change of
   layout, leave it where it is and rearrange around it: with enough containers to fit either layout,
@@ -174,6 +178,33 @@ the same place, made it:
 - **Focus.** When elements reorder, the others move around the one holding the focus. An element that
   has to move anyway, such as the children of a container whose tag changed, gets its focus and
   selection back.
+
+## State inside components
+
+A session's members are the page's state. A reusable component can also keep its own, with
+`volt2::local`:
+
+```cpp
+inline constexpr Component Dropdown = [](std::string label) {
+    bool& open = local(false);
+    return tag::Div(tag::Button[event::OnClick([&open] { open = !open; })](label),
+                    open ? tag::Ul(tag::Li("one"), tag::Li("two")) : None);
+};
+```
+
+- **Each call has its own.** Each place in the code that calls a component has its own state, and
+  inside `Map` and `Loop`, each item does. It is found while the component runs, from the calls
+  that led to it, so where its elements end up does not matter.
+- **The value given is the first one;** later renders return what is stored: `local(0)`,
+  `local<std::string>("text")`, `local<std::vector<int>>()`. Handlers can keep the reference.
+- **State lives as long as the component is called.** A render that does not call it drops its
+  state, so `open ? Dropdown("menu") : None` starts over each time it shows. A component that is
+  called but not shown, such as one built ahead in a variable, keeps it.
+- **In lists, use `Map` with a key,** `Map(s.todos, &Todo::id, [](const Todo& todo) { ... })`, and each
+  item's state goes with it when the list reorders. Without a key, it stays at its position. A plain
+  `for` loop calling a component repeats one call, so its items would share their state; volt2
+  says so in the console.
+- **Only while the page renders,** in `site()` or a component it calls; elsewhere `local` throws.
 
 ## Talking to JavaScript directly
 
@@ -255,7 +286,7 @@ the target upward, in one call; C++ runs their handlers and renders once.
 
 ## Tests
 
-`tests/run.sh` builds six programs every way the machine supports and runs their browser tests
+`tests/run.sh` builds seven programs every way the machine supports and runs their browser tests
 against each build:
 
 | Program | Browser tests |
@@ -266,6 +297,7 @@ against each build:
 | `tests/lifetime` | `lifetime`: functions, object identity, threads, leak warnings |
 | `tests/identity` | `identity`: typing, keys, ids, components, focus, form controls, minimal updates |
 | `tests/diff` | `diff`: 400 random changes; after each, the page must be exactly the rendered tree |
+| `tests/locals` | `locals`: state per component call, keyed and unkeyed lists, when state is kept or dropped |
 
 The builds are g++, clang, ThreadSanitizer, AddressSanitizer with UndefinedBehaviorSanitizer,
 WebAssembly (with Emscripten activated), and the Windows build via MinGW and Wine when installed.
@@ -285,10 +317,11 @@ After editing `web/volt2.js`, run `python3 tools/embed_js.py` to update the copy
 
 1. ~~The bridge, on both builds~~, with ~~lifetimes~~
 2. ~~Markup and sessions~~
-3. ~~Identity: renders keep elements, focus and typed text~~ (this version)
+3. ~~Identity: renders keep elements, focus and typed text~~
 4. Async: awaiting JavaScript promises with C++20 coroutines, and JavaScript awaiting C++
 5. Browser APIs: timers, fetch, storage, console, each driven by JavaScript callbacks
-6. State: change tracking, state per component (`volt2::local`), and shared memory for sessions
+6. State: ~~state per component (`volt2::local`)~~ (this version), change tracking, and shared memory
+   for sessions
 7. Deploy tooling and CI for both builds
 
 ## License
