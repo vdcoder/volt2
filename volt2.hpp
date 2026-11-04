@@ -2425,12 +2425,13 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
 
   // Makes `wanted` the children of `content`, in that order, moving as few nodes as
   // possible: a move loses focus, selection and scroll positions, and reloads iframes.
-  // Nodes that volt2 did not make stay where they are.
+  // Anything else goes: volt2 owns everything inside #volt2, which is what lets C++ know
+  // exactly what is on the page.
   function arrange(content, wanted) {
     const keep = new Set(wanted);
     for (let child = content.firstChild; child; ) {
       const next = child.nextSibling;
-      if (!keep.has(child) && numberOf.has(child)) content.removeChild(child);
+      if (!keep.has(child)) content.removeChild(child);
       child = next;
     }
     const position = new Map();
@@ -2526,9 +2527,9 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
     for (const type of types) {
       if (listening.has(type)) continue;
       listening.add(type);
-      mount.addEventListener(type, deliver, true);
 )VOLT2JS",
-R"VOLT2JS(    }
+R"VOLT2JS(      mount.addEventListener(type, deliver, true);
+    }
   }
 
   function forget(number) {

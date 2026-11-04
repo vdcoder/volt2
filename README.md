@@ -123,6 +123,8 @@ An element is `tag::Name[props...](children...)`; with no props, `tag::Name(chil
 Text is always text: `tag::P("<b>hi</b>")` shows the angle brackets, it never makes HTML.
 
 The page is rendered into the element with `id="volt2"`, or into a new one at the end of `<body>`.
+volt2 owns everything inside it: that is how C++ knows exactly what is on the page. Elements you
+create yourself with `js::Value` belong outside it.
 
 ## Components and identity
 
