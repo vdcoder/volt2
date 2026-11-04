@@ -10,6 +10,28 @@
 //   VOLT2_NO_BROWSER=1  do not open the browser
 //   VOLT2_WARN_AT=500   warn once C++ holds this many JavaScript values or functions
 //                       (default 10000; the threshold doubles after each warning)
+//
+// Contents. Each part starts with a banner of "// ====" lines and the title below; the
+// names next to it are what to search for inside it.
+//
+//   JSON                   the messages between C++ and the page: class Json
+//   js::Value              a JavaScript value seen from C++: class Value, class Function
+//   Runtime state          class Session, struct Options, struct Runtime, request (C++ calls
+//                          the page), serveCall (the page calls C++), makeFunction, intern
+//                          and releaseHandle (lifetimes), noticeGrowth (leak warnings)
+//   Markup                 identity at creation: mixId, callScope, ComponentScope
+//                          the language: class VirtualNode, None, struct Children (what a
+//                          child can be), FirstChild and FirstProp (call sites), class
+//                          Element, class Tag, class Component, Map, Loop
+//                          names: namespace tag, class BasicAttribute, namespace attr
+//                          (KeyName is attr::Key), namespace event
+//   Rendering              class Renderer: renderNow (one render, and the patch format),
+//                          assignPaths (each element's full path), children, update and
+//                          create (the diff), dispatch (events); startPage; run
+//   The page client        web/volt2.js, embedded by tools/embed_js.py: do not edit here
+//   Development backend    the HTTP server and the synchronous bridge: class Bridge,
+//                          serveConnection, openBrowser, runSite
+//   WebAssembly backend    the module's side of the page client: wasmDispatch, runSite
 #pragma once
 
 // volt2 needs C++23: its markup, tag::Div[attr::Id = "x", attr::Class = "y"](...), uses
@@ -22,6 +44,8 @@
 #  endif
 #endif
 
+#include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -31,7 +55,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <atomic>
 #include <deque>
 #include <exception>
 #include <functional>
@@ -40,12 +63,14 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <source_location>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -540,10 +565,8 @@ public:
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
 
-    // Renders the page again. Event handlers do this by themselves, except for events
-    // that elements fire on their own (load, error, toggle, media and animation events):
-    // a render recreates those elements, which would fire the event again and loop. Call
-    // it from such a handler when its state changed, or from other C++ that changes state.
+    // Renders the page again. Event handlers do this by themselves; call it from C++ that
+    // changes the state some other way, such as a js::function the page calls.
     void invalidate();
 
 private:
@@ -1133,9 +1156,9 @@ namespace detail {
 class Renderer;
 struct Children;
 
-// An attribute or an event handler, as made by attr:: and event::.
+// An attribute, an event handler or a key, as made by attr:: and event::.
 struct Prop {
-    enum class Kind { Absent, Attribute, Event };
+    enum class Kind { Absent, Attribute, Event, Key };
     Kind kind = Kind::Absent;  // Absent: a boolean attribute set to false
     std::string name;          // attribute name, or event type
     std::string value;
@@ -1157,8 +1180,79 @@ std::string numberText(N number) {
     }
 }
 
-template <class>
+template <class...>
 inline constexpr bool dependentFalse = false;
+
+// Identity. Every element remembers where in your code it was made: the call site of its
+// tag, and the component calls it was made in. Renders use it to keep each element's DOM
+// node, so focus, typed text and scroll positions stay.
+inline std::uint64_t mixBits(std::uint64_t h) {  // splitmix64's finalizer
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ull;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebull;
+    return h ^ (h >> 31);
+}
+inline std::uint64_t mixId(std::uint64_t seed, std::uint64_t value) { return mixBits(seed ^ mixBits(value + 0x9e3779b97f4a7c15ull)); }
+inline std::uint64_t hashText(std::string_view text) {
+    std::uint64_t h = 0xcbf29ce484222325ull;  // FNV-1a
+    for (unsigned char c : text) h = (h ^ c) * 0x100000001b3ull;
+    return mixBits(h);
+}
+// A call site is its file (the name's address, the same every time that code runs), line
+// and column.
+inline std::uint64_t siteHash(const std::source_location& at) {
+    std::uint64_t h = mixId(0x452821e638d01377ull, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(at.file_name())));
+    return mixId(h, (static_cast<std::uint64_t>(at.line()) << 32) | at.column());
+}
+
+// The component calls in progress, as a chain: chain * base + call, for each call, and
+// how many. Kept this way, the calls of one chain below another can be taken out exactly
+// (callsBetween), so an element's identity counts only the component calls between its
+// parent element and itself, and a component keeps its insides wherever it is called.
+struct CallScope {
+    std::uint64_t chain = 0;
+    std::uint32_t depth = 0;
+};
+inline constexpr std::uint64_t kChainBase = 0x9e3779b97f4a7c15ull;  // odd, so it can be divided out
+inline CallScope& callScope() {
+    thread_local CallScope scope;
+    return scope;
+}
+
+// Where an element was made: its tag's call site, inside these component calls.
+struct Site {
+    std::uint64_t at = 0;
+    CallScope scope;
+};
+inline Site siteOf(const std::source_location& at) { return {siteHash(at), callScope()}; }
+
+// The calls in `inner` below `outer`: for an element made in its parent's arguments, the
+// component calls between the two. An element made elsewhere and passed in (a node given to
+// a component) gets a number of its own, the same on every render.
+inline std::uint64_t callsBetween(const CallScope& outer, const CallScope& inner) {
+    std::uint64_t power = 1;
+    if (inner.depth >= outer.depth) {
+        for (std::uint32_t i = outer.depth; i < inner.depth; ++i) power *= kChainBase;
+        return mixId(inner.depth - outer.depth, inner.chain - outer.chain * power);
+    }
+    for (std::uint32_t i = inner.depth; i < outer.depth; ++i) power *= kChainBase;
+    return mixId(0x8000000000000000ull | (outer.depth - inner.depth), inner.chain * power - outer.chain);
+}
+
+// Elements made while one is alive are made inside that component call.
+class ComponentScope {
+public:
+    explicit ComponentScope(const std::source_location& at) : outer_(callScope()) {
+        callScope() = {outer_.chain * kChainBase + siteHash(at), outer_.depth + 1};
+    }
+    ~ComponentScope() { callScope() = outer_; }
+    ComponentScope(const ComponentScope&) = delete;
+    ComponentScope& operator=(const ComponentScope&) = delete;
+
+private:
+    CallScope outer_;
+};
 
 }  // namespace detail
 
@@ -1171,14 +1265,24 @@ public:
 
 private:
     friend class Element;
+    friend class Tag;
     friend class detail::Renderer;
     friend struct detail::Children;
+
+    static constexpr std::size_t kNoItem = static_cast<std::size_t>(-1);
 
     enum class Kind { Nothing, Text, Element };
     Kind kind_ = Kind::Nothing;
     std::string name_;  // the tag name, or the text
     std::vector<detail::Prop> props_;
     std::vector<VirtualNode> children_;
+    // Who it is: where it was made, its attr::Key, its position in a range of children.
+    detail::Site site_;
+    std::optional<std::string> key_;
+    std::size_t item_ = kNoItem;
+    // Set by the renderer: its identity on the page, and the number of its DOM node.
+    std::uint64_t path_ = 0;
+    std::uint64_t number_ = 0;
 };
 
 // Nothing, wherever a prop or a node can go, so conditionals type-check:
@@ -1214,11 +1318,19 @@ struct Children {
         node.name_ = std::move(text);
         return node;
     }
-    static VirtualNode element(std::string_view name, std::vector<Prop> props) {
+    static VirtualNode element(std::string_view name, Site site, std::vector<Prop> props) {
         VirtualNode node;
         node.kind_ = VirtualNode::Kind::Element;
         node.name_ = std::string(name);
-        node.props_ = std::move(props);
+        node.site_ = site;
+        node.props_.reserve(props.size());
+        for (Prop& prop : props) {
+            if (prop.kind == Prop::Kind::Key) {
+                node.key_ = std::move(prop.value);
+            } else {
+                node.props_.push_back(std::move(prop));
+            }
+        }
         return node;
     }
     template <class T>
@@ -1236,7 +1348,17 @@ struct Children {
         } else if constexpr (OptionalChild<T>) {
             if (child) append(out, *std::forward<T>(child));
         } else {
-            for (auto&& item : child) append(out, VirtualNode(std::forward<decltype(item)>(item)));
+            // A range's items are told apart by their position in it (or by attr::Key), as
+            // they usually come from the same line of code.
+            std::size_t index = 0;
+            for (auto&& item : child) {
+                VirtualNode node(std::forward<decltype(item)>(item));
+                if (!node.isNothing()) {
+                    node.item_ = index;
+                    out.push_back(std::move(node));
+                }
+                ++index;
+            }
         }
     }
     static std::vector<VirtualNode>& children(VirtualNode& node) { return node.children_; }
@@ -1254,54 +1376,110 @@ concept Child = detail::NodeChild<T> || detail::TextChild<T> || detail::NumberCh
 template <class T>
 concept PropLike = std::same_as<std::remove_cvref_t<T>, detail::Prop> || std::same_as<std::remove_cvref_t<T>, NoneType>;
 
-// A tag with its props, waiting for its children: what tag::Div[...] returns.
+namespace detail {
+
+// The first child of tag::Name(...) or the first prop of tag::Name[...], which bring the
+// call site along. They convert on the spot and cannot be copied or moved, so they cannot
+// be kept and shared between calls.
+class FirstChild {
+public:
+    template <Child T>
+    FirstChild(T&& child, std::source_location at = std::source_location::current()) : site_(siteOf(at)) {
+        Children::append(nodes_, std::forward<T>(child));
+    }
+    FirstChild(const FirstChild&) = delete;
+    FirstChild(FirstChild&&) = delete;
+    FirstChild& operator=(const FirstChild&) = delete;
+    FirstChild& operator=(FirstChild&&) = delete;
+
+private:
+    friend class volt2::Tag;
+    Site site_;
+    std::vector<VirtualNode> nodes_;
+};
+
+class FirstProp {
+public:
+    template <PropLike T>
+    FirstProp(T&& prop, std::source_location at = std::source_location::current())
+        : site_(siteOf(at)), prop_(std::forward<T>(prop)) {}
+    FirstProp(const FirstProp&) = delete;
+    FirstProp(FirstProp&&) = delete;
+    FirstProp& operator=(const FirstProp&) = delete;
+    FirstProp& operator=(FirstProp&&) = delete;
+
+private:
+    friend class volt2::Tag;
+    Site site_;
+    Prop prop_;
+};
+
+}  // namespace detail
+
+// A tag with its props, waiting for its children: what tag::Div[...] returns. Use it in the
+// same expression, tag::Div[props](children): a stored one would give every use the same
+// identity.
 class Element {
 public:
     template <Child... C>
-    VirtualNode operator()(C&&... children) const& {
-        return build(props_, std::forward<C>(children)...);
-    }
-    template <Child... C>
     VirtualNode operator()(C&&... children) && {
-        return build(std::move(props_), std::forward<C>(children)...);
-    }
-
-private:
-    friend class Tag;
-    Element(std::string_view name, std::vector<detail::Prop> props) : name_(name), props_(std::move(props)) {}
-
-    template <class... C>
-    VirtualNode build(std::vector<detail::Prop> props, C&&... children) const {
-        VirtualNode node = detail::Children::element(name_, std::move(props));
+        VirtualNode node = detail::Children::element(name_, site_, std::move(props_));
         auto& list = detail::Children::children(node);
         (detail::Children::append(list, std::forward<C>(children)), ...);
         return node;
     }
+    template <Child... C>
+    VirtualNode operator()(C&&...) const& {
+        static_assert(detail::dependentFalse<C...>,
+                      "volt2: write tag::Name[props](children) in one expression; a stored tag::Name[props] would give "
+                      "every element made from it the same identity");
+        return {};
+    }
+    Element(const Element&) = delete;
+    Element& operator=(const Element&) = delete;
+
+private:
+    friend class Tag;
+    Element(std::string_view name, detail::Site site, std::vector<detail::Prop> props)
+        : name_(name), site_(site), props_(std::move(props)) {}
 
     std::string_view name_;
+    detail::Site site_;
     std::vector<detail::Prop> props_;
 };
 
 // An HTML element: tag::P("text") or tag::P[props...](children...). Define your own with
-// `inline constexpr volt2::Tag MyWidget{"my-widget"};`.
+// `inline constexpr volt2::Tag MyWidget{"my-widget"};`. Each call site gives its elements
+// their identity.
 class Tag {
 public:
     constexpr explicit Tag(std::string_view name) : name_(name) {}
 
+    Element operator[](std::source_location at = std::source_location::current()) const {
+        return Element(name_, detail::siteOf(at), {});
+    }
     template <PropLike... P>
-    Element operator[](P&&... props) const {
+    Element operator[](detail::FirstProp first, P&&... rest) const {
         std::vector<detail::Prop> list;
-        list.reserve(sizeof...(P));
+        list.reserve(1 + sizeof...(P));
         auto keep = [&](detail::Prop prop) {
             if (prop.kind != detail::Prop::Kind::Absent) list.push_back(std::move(prop));
         };
-        (keep(std::forward<P>(props)), ...);
-        return Element(name_, std::move(list));
+        keep(std::move(first.prop_));
+        (keep(std::forward<P>(rest)), ...);
+        return Element(name_, first.site_, std::move(list));
     }
 
+    VirtualNode operator()(std::source_location at = std::source_location::current()) const {
+        return detail::Children::element(name_, detail::siteOf(at), {});
+    }
     template <Child... C>
-    VirtualNode operator()(C&&... children) const {
-        return Element(name_, {})(std::forward<C>(children)...);
+    VirtualNode operator()(detail::FirstChild first, C&&... rest) const {
+        VirtualNode node = detail::Children::element(name_, first.site_, {});
+        auto& list = detail::Children::children(node);
+        list = std::move(first.nodes_);
+        (detail::Children::append(list, std::forward<C>(rest)), ...);
+        return node;
     }
 
     constexpr std::string_view name() const { return name_; }
@@ -1309,6 +1487,122 @@ public:
 private:
     std::string_view name_;
 };
+
+// A component: a function that builds part of the page, wrapped where you define it so
+// each place that calls it gets its own identity, and so do the elements it makes:
+//
+//     inline constexpr volt2::Component Card = [](std::string title) {
+//         return tag::Div[attr::Class = "card"](tag::H2(title));
+//     };
+//     ... tag::Main(Card("one"), Card("two")) ...
+//
+// It takes a lambda with fixed parameter types or a function. A lambda that captures
+// cannot be constexpr: make it a local (`const volt2::Component Row = [&s](...) {...};`),
+// or a session member with the signature written out:
+// `volt2::Component<VirtualNode(std::string)> Banner = [this](std::string text) {...};`.
+template <class F>
+struct ComponentCall {
+    using type = void;
+};
+template <class F>
+    requires requires { &F::operator(); }
+struct ComponentCall<F> {
+    using type = decltype(&F::operator());
+};
+
+template <class F, class Signature = typename ComponentCall<F>::type>
+class Component {
+    static_assert(detail::dependentFalse<F>,
+                  "volt2::Component needs a lambda with fixed parameter types (not auto, not mutable) or a function: "
+                  "it adds the call site after the parameters");
+};
+
+// A lambda, noexcept or not.
+template <class F, class R, bool N, class... P>
+class Component<F, R (F::*)(P...) const noexcept(N)> {
+public:
+    constexpr Component(F body) : body_(std::move(body)) {}
+    R operator()(P... args, std::source_location at = std::source_location::current()) const noexcept(N) {
+        detail::ComponentScope scope(at);
+        return body_(std::forward<P>(args)...);
+    }
+
+private:
+    F body_;
+};
+
+// A static lambda (C++23).
+template <class F, class R, bool N, class... P>
+class Component<F, R (*)(P...) noexcept(N)> {
+public:
+    constexpr Component(F) {}
+    R operator()(P... args, std::source_location at = std::source_location::current()) const noexcept(N) {
+        detail::ComponentScope scope(at);
+        return F::operator()(std::forward<P>(args)...);
+    }
+};
+
+// A function.
+template <class R, bool N, class... P>
+class Component<R (*)(P...) noexcept(N), void> {
+public:
+    constexpr Component(R (*body)(P...) noexcept(N)) : body_(body) {}
+    R operator()(P... args, std::source_location at = std::source_location::current()) const noexcept(N) {
+        detail::ComponentScope scope(at);
+        return body_(std::forward<P>(args)...);
+    }
+
+private:
+    R (*body_)(P...) noexcept(N);
+};
+
+// The signature written out, for components that capture, such as session members.
+template <class R, class... P>
+class Component<R(P...), void> {
+public:
+    template <class G>
+        requires std::is_invocable_r_v<R, G&, P...>
+    Component(G body) : body_(std::move(body)) {}
+    R operator()(P... args, std::source_location at = std::source_location::current()) const {
+        detail::ComponentScope scope(at);
+        return body_(std::forward<P>(args)...);
+    }
+
+private:
+    std::function<R(P...)> body_;
+};
+
+template <class F>
+Component(F) -> Component<F>;
+
+// One node per item, like Volt's map: Map(s.fruits, [&](const std::string& fruit) {...}).
+// The function may also take the item's index: [&](const std::string& fruit, std::size_t i).
+// Items are told apart by position; give each an attr::Key when the list can reorder.
+template <std::ranges::input_range R, class F>
+std::vector<VirtualNode> Map(R&& items, F&& make) {
+    std::vector<VirtualNode> nodes;
+    if constexpr (std::ranges::sized_range<R>) nodes.reserve(std::ranges::size(items));
+    std::size_t index = 0;
+    for (auto&& item : items) {
+        if constexpr (std::invocable<F&, std::ranges::range_reference_t<R>, std::size_t>) {
+            nodes.push_back(make(std::forward<decltype(item)>(item), index));
+        } else {
+            nodes.push_back(make(std::forward<decltype(item)>(item)));
+        }
+        ++index;
+    }
+    return nodes;
+}
+
+// `count` nodes, like Volt's loop: Loop(3, [](std::size_t i) { return tag::Li(i); }).
+template <class F>
+    requires std::invocable<F&, std::size_t>
+std::vector<VirtualNode> Loop(std::size_t count, F&& make) {
+    std::vector<VirtualNode> nodes;
+    nodes.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) nodes.push_back(make(index));
+    return nodes;
+}
 
 // How an attribute writes `= true` and `= false`.
 enum class Booleans {
@@ -1418,12 +1712,26 @@ inline BasicAttribute<std::string, Booleans::TrueFalse> Data(std::string_view ke
 inline BasicAttribute<std::string, Booleans::TrueFalse> Aria(std::string_view key) {
     return BasicAttribute<std::string, Booleans::TrueFalse>("aria-" + std::string(key));
 }
+
+// Not an HTML attribute: says which element this is among its siblings, whichever line of
+// code made it, so the items of a list keep their DOM nodes when the list reorders, and a
+// new key starts an element over. A string or an integer, unique among its siblings:
+// attr::Key = fruit.id.
+class KeyName {
+public:
+    detail::Prop operator=(std::string_view value) const { return {detail::Prop::Kind::Key, "key", std::string(value), {}}; }
+    template <std::integral I>
+        requires(!std::same_as<I, bool> && !std::same_as<I, char>)
+    detail::Prop operator=(I value) const {
+        return {detail::Prop::Kind::Key, "key", std::to_string(value), {}};
+    }
+};
+inline constexpr KeyName Key{};
 }  // namespace attr
 
 // Event handlers: event::OnClick(handler). A handler takes the event (const Value&) or
 // nothing; the event's currentTarget is the handler's own element. After a handler runs,
-// volt2 renders the page again, except after events the elements fire on their own
-// (see Session::invalidate).
+// volt2 renders the page again.
 namespace event {
 template <class F>
 concept Handler = std::invocable<F&, const js::Value&> || std::invocable<F&>;
@@ -1507,8 +1815,15 @@ VOLT2_EVENT(OnTransitionEnd, "transitionend")
 // ============================================================================
 namespace detail {
 
-// Renders a site's tree into the page, and runs its event handlers. This version
-// rebuilds the page's elements on every render: no identity preservation yet.
+// Renders a site's tree into the page, and runs its event handlers. It keeps the tree it
+// rendered last and sends the page only what changed, so elements keep their DOM nodes,
+// and with them focus, typed text, scroll positions and playing media.
+//
+// An element's identity is its path: its parent's path mixed with where it was made (see
+// Tag and Component) and with its attr::Key or its position in a range. An element with an
+// id starts a path of its own, so it keeps its DOM node wherever it moves on the page. A
+// new element with the same path and tag as one already shown is that element, updated in
+// place; a text child keeps its node when it is the same text child of the same element.
 class Renderer {
 public:
     explicit Renderer(std::function<VirtualNode()> render) : render_(std::move(render)) {}
@@ -1529,23 +1844,23 @@ public:
     }
 
 private:
-    // Events that elements fire by themselves. A render recreates the elements (no
-    // identity preservation yet), which would fire these again: rendering after them
-    // automatically would loop, so they render only through Session::invalidate.
-    static bool firedByElement(std::string_view type) {
-        static constexpr std::string_view types[] = {
-            "load", "error", "abort", "toggle", "beforetoggle", "animationstart", "animationend", "animationiteration",
-            "animationcancel", "transitionrun", "transitionstart", "transitionend", "transitioncancel", "loadstart",
-            "loadeddata", "loadedmetadata", "canplay", "canplaythrough", "durationchange", "emptied", "ended", "pause",
-            "play", "playing", "progress", "ratechange", "seeked", "seeking", "stalled", "suspend", "timeupdate",
-            "volumechange", "waiting"};
-        for (std::string_view known : types) {
-            if (known == type) return true;
-        }
-        return false;
-    }
+    using Nodes = std::vector<VirtualNode>;
+    using Attributes = std::vector<std::pair<std::string_view, std::string_view>>;
+    static constexpr std::uint64_t kRootPath = 0x243f6a8885a308d3ull;
+    static constexpr std::uint64_t kIdPath = 0x13198a2e03707344ull;
+    static constexpr std::uint64_t kKeyed = 0xa4093822299f31d0ull;
+    static constexpr std::uint64_t kMount = 0;  // the number of #volt2, which holds the page
 
-    // One message per render: the whole tree as JSON; volt2.js builds the elements.
+    // One message per render, and none when nothing changed:
+    //   p: steps, run in order, each naming a DOM node by its number:
+    //        ["o", n, children]     n's children become these, in this order
+    //        ["a", n, name, value]  sets an attribute (value null: removes it)
+    //        ["t", n, text]         sets a text node's text
+    //        ["e", n, types]        the event types n has handlers for
+    //      A child is an existing node's number, or a new node: {n, x: text} or
+    //      {n, t: tag, a: [[name, value]...], e: [types], c: [children]}.
+    //   x: the numbers of the nodes no longer used;  w: warnings for the console;
+    //   r: start over (the first render);  f: the event dispatcher.
     void renderNow() {
         rendering_ = true;
         pending_ = false;
@@ -1553,66 +1868,269 @@ private:
             bool& flag;
             ~Done() { flag = false; }
         } done{rendering_};
-        VirtualNode next = render_();
-        current_ = std::move(next);  // the previous tree goes only now, after its handlers ran
-        withHandlers_.clear();
-        Json render = op("render");
-        render.set("k", current_.isNothing() ? Json() : serialize(current_));
-        render.set("f", toWire(dispatcher_.value()));
-        request(std::move(render));
+        const CallScope base = callScope();  // the calls around site(): none
+        Nodes next;
+        if (VirtualNode root = render_(); !root.isNothing()) next.push_back(std::move(root));
+
+        const bool reset = fresh_;
+        fresh_ = true;  // until the page has this render: if it never gets it, the next one starts over
+        Nodes previous = std::move(shown_);
+        old_ = std::move(byPath_);  // points into previous: moving a vector leaves its elements in place
+        if (reset) old_.clear();
+        shown_ = std::move(next);
+        byPath_.clear();
+        handlers_.clear();
+        claimed_.clear();
+
+        Json warnings = Json::array();
+        assignPaths(shown_, kRootPath, base, warnings);
+        Json steps = Json::array();
+        diffChildren(kMount, reset ? nullptr : &previous, shown_, steps);
+        old_.clear();
+        Json unused = Json::array();
+        if (!reset) collectUnused(previous, unused);
+        if (!reset && steps.items().empty() && unused.items().empty() && warnings.items().empty()) {
+            fresh_ = false;
+            return;
+        }
+
+        Json patch = op("patch");
+        patch.set("p", std::move(steps));
+        patch.set("x", std::move(unused));
+        if (!warnings.items().empty()) patch.set("w", std::move(warnings));
+        if (reset) {
+            patch.set("r", Json::boolean(true));
+            patch.set("f", toWire(dispatcher_.value()));
+        }
+        request(std::move(patch));
+        fresh_ = false;
     }
 
-    Json serialize(const VirtualNode& node) {
-        if (node.kind_ == VirtualNode::Kind::Text) return Json::string(node.name_);
-        Json element = Json::object();
-        element.set("t", Json::string(node.name_));
-        Json attributes = Json::array();
-        Json events = Json::array();
-        for (const Prop& prop : node.props_) {
-            if (prop.kind == Prop::Kind::Attribute) {
-                Json pair = Json::array();
-                pair.push(Json::string(prop.name));
-                pair.push(Json::string(prop.value));
-                attributes.push(std::move(pair));
-            } else if (prop.kind == Prop::Kind::Event) {
-                bool seen = false;
-                for (const Json& type : events.items()) seen = seen || type.asString() == prop.name;
-                if (!seen) events.push(Json::string(prop.name));
+    // Each element's path: its parent's path and its own place under that parent, which is
+    // its key if it has one, or else where it was made (its call site and the component
+    // calls between its parent and it) and its position in a range. An id starts a path of
+    // its own.
+    void assignPaths(Nodes& nodes, std::uint64_t parent, const CallScope& scope, Json& warnings) {
+        for (VirtualNode& node : nodes) {
+            if (node.kind_ != VirtualNode::Kind::Element) continue;
+            const std::string* id = attribute(node, "id");
+            std::uint64_t path;
+            if (id) {
+                path = mixId(kIdPath, hashText(*id));
+            } else if (node.key_) {
+                path = mixId(parent, mixId(kKeyed, hashText(*node.key_)));
+            } else {
+                std::uint64_t own = mixId(callsBetween(scope, node.site_.scope), node.site_.at);
+                if (node.item_ != VirtualNode::kNoItem) own = mixId(mixId(own, 2), node.item_);
+                path = mixId(parent, own);
+            }
+            if (!byPath_.try_emplace(path, &node).second) {
+                if (id) {
+                    warn(warnings, "two elements have id=\"" + *id + "\"; an id must be unique on the page");
+                } else if (node.key_) {
+                    warn(warnings, "two elements under the same parent have attr::Key = \"" + *node.key_ +
+                                       "\"; a key must be unique among its siblings");
+                }
+                // Otherwise the same code made both, such as a helper function called twice that is
+                // not a volt2::Component: they are told apart by their order.
+                const std::uint64_t taken = path;
+                for (std::uint64_t n = 1; !byPath_.try_emplace(path = mixId(taken, n), &node).second; ++n) {
+                }
+            }
+            node.path_ = path;
+            assignPaths(node.children_, path, node.site_.scope, warnings);
+        }
+    }
+
+    void warn(Json& warnings, const std::string& message) {
+        if (!warned_.insert(message).second) return;  // once per page
+#ifndef __EMSCRIPTEN__
+        logError(message);
+#endif
+        warnings.push(Json::string(message));
+    }
+
+    // The children of node `number` become `nodes`; `old` is what it had.
+    void diffChildren(std::uint64_t number, Nodes* old, Nodes& nodes, Json& steps) {
+        bool same = false;
+        Json list = children(old, nodes, steps, same);
+        if (!same) steps.push(step("o", number, std::move(list)));
+    }
+
+    Json children(Nodes* old, Nodes& nodes, Json& steps, bool& same) {
+        std::vector<VirtualNode*> oldTexts;
+        if (old) {
+            for (VirtualNode& node : *old) {
+                if (node.kind_ == VirtualNode::Kind::Text) oldTexts.push_back(&node);
             }
         }
-        element.set("a", std::move(attributes));
-        if (!events.items().empty()) {
-            element.set("i", Json::number(static_cast<double>(withHandlers_.size())));
-            withHandlers_.push_back(&node);
-            element.set("e", std::move(events));
+        std::size_t texts = 0;
+        same = old && old->size() == nodes.size();
+        Json list = Json::array();
+        for (std::size_t i = 0; i < nodes.size(); ++i) {
+            VirtualNode& node = nodes[i];
+            VirtualNode* match = nullptr;
+            if (node.kind_ == VirtualNode::Kind::Text) {
+                if (texts < oldTexts.size()) match = oldTexts[texts];
+                ++texts;
+            } else {
+                match = find(node);
+            }
+            list.push(match ? update(*match, node, steps) : create(node, steps));
+            same = same && match == &(*old)[i];
         }
-        Json children = Json::array();
-        for (const VirtualNode& child : node.children_) children.push(serialize(child));
-        element.set("c", std::move(children));
-        return element;
+        return list;
     }
 
-    // Called by volt2.js with the elements that have handlers for this event, from the
-    // target upward, and for each one a view of the event whose currentTarget is that
-    // element. Handlers run first, then the page renders once. A handler that makes
-    // another event fire (element.call("click")) runs that one too, on the same tree,
-    // and the render still happens once, at the end.
+    VirtualNode* find(const VirtualNode& node) {
+        auto found = old_.find(node.path_);
+        if (found == old_.end()) return nullptr;
+        VirtualNode* old = found->second;
+        if (old->name_ != node.name_ || claimed_.contains(old->number_)) return nullptr;
+        return old;
+    }
+
+    // `node` is `old`, shown again: it keeps its DOM node, and the page gets what changed.
+    Json update(VirtualNode& old, VirtualNode& node, Json& steps) {
+        node.number_ = old.number_;
+        claimed_.insert(old.number_);
+        if (node.kind_ == VirtualNode::Kind::Text) {
+            if (node.name_ != old.name_) steps.push(step("t", node.number_, Json::string(node.name_)));
+        } else {
+            diffAttributes(old, node, steps);
+            std::vector<std::string_view> types = eventTypes(node);
+            if (types != eventTypes(old)) steps.push(step("e", node.number_, strings(types)));
+            if (!types.empty()) handlers_[node.number_] = &node;
+            diffChildren(node.number_, &old.children_, node.children_, steps);
+        }
+        return Json::number(static_cast<double>(node.number_));
+    }
+
+    Json create(VirtualNode& node, Json& steps) {
+        node.number_ = nextNumber_++;
+        Json made = Json::object();
+        made.set("n", Json::number(static_cast<double>(node.number_)));
+        if (node.kind_ == VirtualNode::Kind::Text) {
+            made.set("x", Json::string(node.name_));
+            return made;
+        }
+        made.set("t", Json::string(node.name_));
+        Json list = Json::array();
+        for (const auto& [name, value] : attributes(node)) {
+            Json pair = Json::array();
+            pair.push(Json::string(std::string(name)));
+            pair.push(Json::string(std::string(value)));
+            list.push(std::move(pair));
+        }
+        made.set("a", std::move(list));
+        std::vector<std::string_view> types = eventTypes(node);
+        if (!types.empty()) {
+            made.set("e", strings(types));
+            handlers_[node.number_] = &node;
+        }
+        bool same = false;
+        made.set("c", children(nullptr, node.children_, steps, same));  // some may be shown already elsewhere
+        return made;
+    }
+
+    void diffAttributes(const VirtualNode& old, const VirtualNode& node, Json& steps) {
+        Attributes was = attributes(old);
+        Attributes now = attributes(node);
+        auto lookup = [](const Attributes& list, std::string_view name) -> const std::string_view* {
+            for (const auto& attribute : list) {
+                if (attribute.first == name) return &attribute.second;
+            }
+            return nullptr;
+        };
+        for (const auto& [name, value] : now) {
+            const std::string_view* before = lookup(was, name);
+            if (!before || *before != value) {
+                steps.push(step("a", node.number_, Json::string(std::string(name)), Json::string(std::string(value))));
+            }
+        }
+        for (const auto& [name, value] : was) {
+            if (!lookup(now, name)) steps.push(step("a", node.number_, Json::string(std::string(name)), Json()));
+        }
+    }
+
+    // An element's attributes, the last value winning when one is given twice.
+    static Attributes attributes(const VirtualNode& node) {
+        Attributes list;
+        for (const Prop& prop : node.props_) {
+            if (prop.kind != Prop::Kind::Attribute) continue;
+            auto same = std::ranges::find(list, std::string_view(prop.name), &Attributes::value_type::first);
+            if (same != list.end()) {
+                same->second = prop.value;
+            } else {
+                list.emplace_back(prop.name, prop.value);
+            }
+        }
+        return list;
+    }
+
+    static const std::string* attribute(const VirtualNode& node, std::string_view name) {
+        const std::string* value = nullptr;
+        for (const Prop& prop : node.props_) {
+            if (prop.kind == Prop::Kind::Attribute && prop.name == name) value = &prop.value;
+        }
+        return value;
+    }
+
+    static std::vector<std::string_view> eventTypes(const VirtualNode& node) {
+        std::vector<std::string_view> types;
+        for (const Prop& prop : node.props_) {
+            if (prop.kind == Prop::Kind::Event) types.push_back(prop.name);
+        }
+        std::ranges::sort(types);
+        types.erase(std::unique(types.begin(), types.end()), types.end());
+        return types;
+    }
+
+    static Json strings(const std::vector<std::string_view>& items) {
+        Json list = Json::array();
+        for (std::string_view item : items) list.push(Json::string(std::string(item)));
+        return list;
+    }
+
+    template <class... More>
+    static Json step(const char* kind, std::uint64_t number, More&&... more) {
+        Json list = Json::array();
+        list.push(Json::string(kind));
+        list.push(Json::number(static_cast<double>(number)));
+        (list.push(std::forward<More>(more)), ...);
+        return list;
+    }
+
+    // Nodes of the previous tree that this render did not keep.
+    void collectUnused(const Nodes& nodes, Json& unused) {
+        for (const VirtualNode& node : nodes) {
+            if (!claimed_.contains(node.number_)) unused.push(Json::number(static_cast<double>(node.number_)));
+            collectUnused(node.children_, unused);
+        }
+    }
+
+    // Called by volt2.js with the numbers of the elements that have handlers for this
+    // event, from the target upward, and for each one a view of the event whose
+    // currentTarget is that element. Handlers run first, then the page renders once. A
+    // handler that makes another event fire (element.call("click")) runs that one too, on
+    // the same tree, and the render still happens once, at the end.
     void dispatch(const js::Args& args) {
         Json chain = Json::parse(args.at(0).as<std::string>());
         const std::string type = args.at(1).as<std::string>();
-        if (!firedByElement(type)) pending_ = true;
+        pending_ = true;
         ++depth_;
         std::exception_ptr failure;
         try {
-            const auto& indices = chain.items();
-            for (std::size_t n = 0; n < indices.size() && n + 2 < args.size(); ++n) {
-                auto index = static_cast<std::size_t>(indices[n].asNumber());
-                if (index >= withHandlers_.size()) break;
+            const auto& numbers = chain.items();
+            for (std::size_t n = 0; n < numbers.size() && n + 2 < args.size(); ++n) {
                 const js::Value& event = args[n + 2];
-                for (const Prop& prop : withHandlers_[index]->props_) {
-                    if (prop.kind == Prop::Kind::Event && prop.name == type) prop.handler(event);
+                auto found = handlers_.find(static_cast<std::uint64_t>(numbers[n].asNumber()));
+                if (found != handlers_.end()) {
+                    for (const Prop& prop : found->second->props_) {
+                        if (prop.kind == Prop::Kind::Event && prop.name == type) prop.handler(event);
+                    }
                 }
-                if (n + 1 < indices.size() && event["cancelBubble"].as<bool>()) break;  // stopPropagation()
+                if (n + 1 < numbers.size() && event["cancelBubble"].as<bool>()) break;  // stopPropagation()
             }
         } catch (const PageReplaced&) {
             --depth_;
@@ -1626,11 +2144,17 @@ private:
 
     std::function<VirtualNode()> render_;
     js::Function dispatcher_;
-    VirtualNode current_;
-    std::vector<const VirtualNode*> withHandlers_;  // index in the JSON -> node in current_
+    Nodes shown_;                                                     // the tree on the page
+    std::unordered_map<std::uint64_t, VirtualNode*> byPath_;          // its elements by path
+    std::unordered_map<std::uint64_t, VirtualNode*> old_;             // while rendering: the previous tree's
+    std::unordered_set<std::uint64_t> claimed_;                       // while rendering: previous nodes kept
+    std::unordered_map<std::uint64_t, const VirtualNode*> handlers_;  // node number -> element with handlers
+    std::unordered_set<std::string> warned_;
+    std::uint64_t nextNumber_ = 1;
     int depth_ = 0;
-    bool pending_ = false;    // a render is due when the handlers finish
+    bool pending_ = false;  // a render is due when the handlers finish
     bool rendering_ = false;
+    bool fresh_ = true;  // the next render starts the page over
 };
 
 struct Sessions {
@@ -1826,8 +2350,8 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
         return Reflect.construct(fromWire(op.o), args);
       case 'typeof':
         return typeof fromWire(op.o);
-      case 'render':
-        return render(op.k, fromWire(op.f));
+      case 'patch':
+        return patch(op);
       case 'fn': {
         const id = op.k;
         return function () {
@@ -1839,54 +2363,259 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
     }
   }
 
-  // Rendering. C++ sends the whole tree (no identity preservation yet) and this builds
-  // the elements into #volt2, created at the end of <body> if the page has none. Tree
-  // nodes are strings (text) or {t: tag, a: [[name, value]...], c: [children], and for
-  // elements with handlers i: index, e: [event types]}. One capturing listener per event
-  // type on the mount sends C++ the indices of the elements with handlers for that event,
-  // from the target upward (only the target when the event does not bubble).
-  const mounts = new WeakMap(); // mount element -> { nodes, types, dispatch }
+  // Rendering. C++ keeps the tree it rendered last and sends one patch per render with
+  // what changed (see Renderer::renderNow in volt2.hpp for its format). Every DOM node
+  // volt2 made has a number; 0 is the mount, #volt2, created at the end of <body> if the
+  // page has none. One capturing listener per event type on the mount sends C++ the
+  // numbers of the elements with handlers for that event, from the target upward (only
+  // the target when the event does not bubble).
+  const nodes = new Map(); // number -> DOM node
+  const numberOf = new WeakMap(); // DOM node -> number
+  const handled = new WeakMap(); // element -> the event types it has C++ handlers for
+  let listening = new Set(); // event types the mount listens to
+  let mount = null;
+  let dispatcher = null; // C++: runs the handlers for an event
+  let patching = false; // events the patch itself causes, such as focus moving, are not sent
 
   function mountElement() {
-    let mount = document.getElementById('volt2');
-    if (!mount) {
-      mount = document.createElement('div');
-      mount.id = 'volt2';
-      document.body.appendChild(mount);
+    let element = document.getElementById('volt2');
+    if (!element) {
+      element = document.createElement('div');
+      element.id = 'volt2';
+      document.body.appendChild(element);
     }
-    return mount;
-  }
-
-  function build(node, state, mount) {
-    if (typeof node === 'string') return document.createTextNode(node);
-    const element = document.createElement(node.t);
-    for (const pair of node.a) element.setAttribute(pair[0], pair[1]);
-    if (node.e) {
-      state.nodes.set(element, { index: node.i, types: node.e });
-      for (const type of node.e) {
-        if (state.types.has(type)) continue;
-        state.types.add(type);
-        mount.addEventListener(type, function (event) { deliver(mount, event); }, true);
-      }
-    }
-    const parent = node.t === 'template' ? element.content : element; // a template's children are its content
-    for (const child of node.c) parent.appendChild(build(child, state, mount));
     return element;
   }
 
-  function render(tree, dispatch) {
-    const mount = mountElement();
-    let state = mounts.get(mount);
-    if (!state) {
-      state = { types: new Set() };
-      mounts.set(mount, state);
+  function nodeNumbered(number) {
+    const node = nodes.get(number);
+    if (node === undefined) throw new Error('volt2: the page has no node #' + number);
+    return node;
+  }
+
+  function contentOf(element) {
+    return element.tagName === 'TEMPLATE' ? element.content : element; // a template's children are its content
+  }
+
+  function patch(message) {
+    if (message.r || !mount) {
+      const element = mountElement();
+      if (element !== mount) {
+        mount = element;
+        listening = new Set();
+      }
+      nodes.clear();
+      mount.replaceChildren();
+      nodes.set(0, mount);
     }
-    state.nodes = new WeakMap();
-    state.dispatch = dispatch;
-    const content = document.createDocumentFragment();
-    if (tree !== null) content.appendChild(build(tree, state, mount));
-    mount.replaceChildren(content);
+    if (message.f) dispatcher = fromWire(message.f);
+    for (const warning of message.w || []) console.warn('volt2: ' + warning);
+    const active = document.activeElement;
+    const selection = selectionOf(active);
+    const live = [];
+    const selects = new Set();
+    patching = true;
+    try {
+      for (const step of message.p) {
+        const select = selectAround(run(step, live));
+        if (select) selects.add(select);
+      }
+      // A select shows the option that matches its value, which can be another option once
+      // its options change: its value is applied again.
+      for (const select of selects) {
+        const value = select.getAttribute('value');
+        if (value !== null) live.push([select, 'value', value]);
+      }
+      for (const change of live) setLive(change[0], change[1], change[2]);
+      for (const number of message.x) forget(number);
+      // A move loses the focus; arrange avoids moving the focused element, but if it had
+      // to, the focus and the selection come back.
+      if (active && active !== document.activeElement && active.isConnected) {
+        active.focus({ preventScroll: true });
+        if (selection) {
+          try {
+            active.setSelectionRange(selection[0], selection[1], selection[2]);
+          } catch (e) {}
+        }
+      }
+    } finally {
+      patching = false;
+    }
     return undefined;
+  }
+
+  function selectionOf(element) {
+    try {
+      if (element && typeof element.selectionStart === 'number') {
+        return [element.selectionStart, element.selectionEnd, element.selectionDirection];
+      }
+    } catch (e) {} // some input types have no selection
+    return null;
+  }
+
+  function run(step, live) {
+    const node = nodeNumbered(step[1]);
+    switch (step[0]) {
+      case 'o':
+        arrange(contentOf(node), step[2].map(function (child) { return make(child, live); }));
+        break;
+      case 'a':
+        setAttribute(node, step[2], step[3], live);
+        break;
+      case 't':
+        node.nodeValue = step[2];
+        break;
+      case 'e':
+        setHandlers(node, step[2]);
+        break;
+      default:
+        throw new Error('volt2: unknown patch step ' + step[0]);
+    }
+    return node;
+  }
+
+  // The select a changed node belongs to: the select itself, or one of its options.
+  function selectAround(node) {
+    for (let element = node.nodeType === 1 ? node : node.parentNode; element && element.nodeType === 1; element = element.parentNode) {
+      if (element.tagName === 'SELECT') return element;
+      if (element.tagName !== 'OPTION' && element.tagName !== 'OPTGROUP') return null;
+    }
+    return null;
+  }
+
+  // An existing node by number, or a new one with its children.
+  function make(child, live) {
+    if (typeof child === 'number') return nodeNumbered(child);
+    let node;
+    if ('x' in child) {
+      node = document.createTextNode(child.x);
+    } else {
+      node = document.createElement(child.t);
+      for (const pair of child.a) setAttribute(node, pair[0], pair[1], live);
+      if (child.e) setHandlers(node, child.e);
+      const content = contentOf(node);
+      for (const grandchild of child.c) content.appendChild(make(grandchild, live));
+    }
+    nodes.set(child.n, node);
+    numberOf.set(node, child.n);
+    return node;
+  }
+
+  // Makes `wanted` the children of `content`, in that order, moving as few nodes as
+  // possible: a move loses focus, selection and scroll positions, and reloads iframes.
+  // Anything else goes: volt2 owns everything inside #volt2, which is what lets C++ know
+  // exactly what is on the page.
+  function arrange(content, wanted) {
+    const keep = new Set(wanted);
+    for (let child = content.firstChild; child; ) {
+      const next = child.nextSibling;
+      if (!keep.has(child)) content.removeChild(child);
+      child = next;
+    }
+    const position = new Map();
+    let index = 0;
+    for (let child = content.firstChild; child; child = child.nextSibling) position.set(child, index++);
+    const stay = staying(wanted, position);
+    let before = null;
+    for (let k = wanted.length - 1; k >= 0; k--) {
+      if (!stay[k]) content.insertBefore(wanted[k], before);
+      before = wanted[k];
+    }
+  }
+
+  // Which wanted nodes stay put: the longest run already in order, so the fewest move. The
+  // one holding the focus stays whenever it is already there, even if more must move.
+  function staying(wanted, position) {
+    const stay = new Array(wanted.length).fill(false);
+    const active = document.activeElement;
+    let pinned = -1;
+    if (active && active !== document.body) {
+      for (let k = 0; k < wanted.length && pinned < 0; k++) {
+        if (position.has(wanted[k]) && wanted[k].contains(active)) pinned = k;
+      }
+    }
+    if (pinned < 0) {
+      longestInOrder(wanted, position, 0, wanted.length, -1, Infinity, stay);
+    } else {
+      const at = position.get(wanted[pinned]);
+      stay[pinned] = true;
+      longestInOrder(wanted, position, 0, pinned, -1, at, stay);
+      longestInOrder(wanted, position, pinned + 1, wanted.length, at, Infinity, stay);
+    }
+    return stay;
+  }
+
+  // Marks the longest increasing run of current positions among wanted[from..to) that lie
+  // between low and high.
+  function longestInOrder(wanted, position, from, to, low, high, stay) {
+    const ks = [];
+    const ps = [];
+    for (let k = from; k < to; k++) {
+      const p = position.get(wanted[k]);
+      if (p !== undefined && p > low && p < high) {
+        ks.push(k);
+        ps.push(p);
+      }
+    }
+    const tails = []; // tails[length - 1]: the run of that length ending lowest
+    const previous = new Array(ks.length);
+    for (let j = 0; j < ks.length; j++) {
+      let lo = 0;
+      let hi = tails.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (ps[tails[mid]] < ps[j]) lo = mid + 1;
+        else hi = mid;
+      }
+      previous[j] = lo > 0 ? tails[lo - 1] : -1;
+      tails[lo] = j;
+    }
+    for (let j = tails.length ? tails[tails.length - 1] : -1; j >= 0; j = previous[j]) stay[ks[j]] = true;
+  }
+
+  function setAttribute(element, name, value, live) {
+    if (value === null) element.removeAttribute(name);
+    else element.setAttribute(name, value);
+    if (name === 'value' || name === 'checked' || name === 'selected') live.push([element, name, value]);
+  }
+
+  // What a form control shows is a property, which typing and clicking change; its
+  // attribute is only the starting value. So these are set as properties too, once the
+  // patch's elements are in place (a select needs its options first). An unchanged value
+)VOLT2JS",
+R"VOLT2JS(  // is left alone, which keeps the caret where it is.
+  function setLive(element, name, value) {
+    const tag = element.tagName;
+    try {
+      if (name === 'value' && (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT')) {
+        const text = value === null ? '' : value;
+        if (element.value !== text) element.value = text;
+      } else if (name === 'checked' && tag === 'INPUT') {
+        element.checked = value !== null;
+      } else if (name === 'selected' && tag === 'OPTION') {
+        element.selected = value !== null;
+      }
+    } catch (e) {
+      console.error('volt2: cannot set ' + name + ' on <' + tag.toLowerCase() + '>: ' + e.message);
+    }
+  }
+
+  function setHandlers(element, types) {
+    if (types.length) handled.set(element, types);
+    else handled.delete(element);
+    for (const type of types) {
+      if (listening.has(type)) continue;
+      listening.add(type);
+      mount.addEventListener(type, deliver, true);
+    }
+  }
+
+  function forget(number) {
+    const node = nodes.get(number);
+    if (node === undefined) return;
+    nodes.delete(number);
+    numberOf.delete(node);
+    handled.delete(node);
   }
 
   // The event as one handler sees it: currentTarget is that handler's element (the real
@@ -1905,19 +2634,19 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
     });
   }
 
-  function deliver(mount, event) {
-    const state = mounts.get(mount);
+  function deliver(event) {
+    if (patching || !dispatcher) return;
     const chain = [];
     const views = [];
     for (let node = event.target; node && node !== mount; node = node.parentNode) {
-      const info = state.nodes.get(node);
-      if (info && info.types.indexOf(event.type) >= 0) {
-        chain.push(info.index);
+      const types = handled.get(node);
+      if (types && types.indexOf(event.type) >= 0) {
+        chain.push(numberOf.get(node));
         views.push(eventFor(event, node));
       }
       if (!event.bubbles) break;
     }
-    if (chain.length) state.dispatch.apply(null, [JSON.stringify(chain), event.type].concat(views));
+    if (chain.length) dispatcher.apply(null, [JSON.stringify(chain), event.type].concat(views));
   }
 
   // Runs one operation for C++. Errors are returned, never thrown across the bridge.
@@ -2004,6 +2733,9 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
     execJson: execJson,
     handleCount: function () {
       return handles.size;
+    },
+    nodeCount: function () {
+      return nodes.size; // DOM nodes volt2 tracks, the mount included
     },
   };
   globalThis.volt2 = api;

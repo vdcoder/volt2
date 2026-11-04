@@ -26,8 +26,8 @@ int main() { return run(site); }
 - **To deploy,** compile the same file with Emscripten. The site becomes static files
   (`index.html`, `volt2.js`, `app.js`, `app.wasm`) for any web host. No server.
 
-See [`examples/counter`](examples/counter/main.cpp) for a counter, a panel that opens and closes,
-and a list.
+See [`examples/counter`](examples/counter/main.cpp) for a counter, a greeting typed live, a panel
+that opens and closes, and a list.
 
 ## Develop
 
@@ -76,7 +76,7 @@ destroys it when that page goes away (reloaded, or replaced by another tab):
 - its **destructor** is the cleanup.
 
 `invalidate()` (a `Session` member) renders the page again. Event handlers do that by themselves;
-call it from C++ that changes state some other way, or from the handlers that don't (see Events below).
+call it from C++ that changes state some other way, such as a `js::function` the page calls.
 
 `volt2::run(site)` works out the session type from `site`'s parameter. Any default-constructible
 type derived from `volt2::Session` works; anything else is a compile error.
@@ -103,15 +103,11 @@ An element is `tag::Name[props...](children...)`; with no props, `tag::Name(chil
 - **Events:** `event::OnClick`, `event::OnInput`, `event::OnSubmit`, `event::OnKeyDown`, ... and
   `event::On("my-event", handler)` for any other type. A handler takes the event (`const Value&`)
   or nothing; the event's `currentTarget` is the handler's own element. After a handler runs, volt2
-  calls your site again and renders the result. `e.call("preventDefault")` and
+  calls your site again and updates the page. `e.call("preventDefault")` and
   `e.call("stopPropagation")` work, also while developing, because every call to the page is
   synchronous.
-- **Events elements fire on their own** (`OnLoad`, `OnError`, `OnToggle`, media and animation events)
-  don't render by themselves: a render recreates the element, which would fire the event again and
-  loop. When such a handler changes state, have it call `s.invalidate()`, and only when something
-  changed, for example `if (!s.loaded) { s.loaded = true; s.invalidate(); }`.
 - **Children:** elements, text, numbers, `std::optional<VirtualNode>`, and ranges of elements, such
-  as a `std::vector<VirtualNode>` or `items | std::views::transform(...)`.
+  as a `std::vector<VirtualNode>`, `items | std::views::transform(...)` or `Map(items, ...)`.
 - **Nothing:** `None` stands for no prop between the brackets and no node between the parentheses, so
   conditionals type-check in both places:
 
@@ -127,6 +123,55 @@ An element is `tag::Name[props...](children...)`; with no props, `tag::Name(chil
 Text is always text: `tag::P("<b>hi</b>")` shows the angle brackets, it never makes HTML.
 
 The page is rendered into the element with `id="volt2"`, or into a new one at the end of `<body>`.
+volt2 owns everything inside it: that is how C++ knows exactly what is on the page. Elements you
+create yourself with `js::Value` belong outside it.
+
+## Components and identity
+
+Every render calls your site again, and volt2 changes only what differs on the page. Elements keep
+their DOM nodes from one render to the next, and with them the focus, the caret, typed text, scroll
+positions and playing media. An element counts as the same one as last time when the same code, in
+the same place, made it:
+
+- **Call sites.** Every `tag::Name(...)` and `tag::Name[...]` knows where it is in your code, so the
+  two branches of `open ? tag::P("a") : tag::P("b")` are different elements, and so are two
+  `tag::Li`s on different lines. Write `tag::Name[props](children)` in one expression: a
+  `tag::Name[props]` kept in a variable and used later is a compile error, because all its uses would
+  be the same element.
+- **Components.** Wrap a function that builds part of the page in `volt2::Component` where you define
+  it, and each place that calls it gets elements of its own:
+
+  ```cpp
+  inline constexpr Component Card = [](std::string title) {
+      return tag::Div[attr::Class = "card"](tag::H2(title));
+  };
+
+  tag::Main(Card("one"), Card("two"))
+  ```
+
+  A component that needs the session takes it as a parameter, like
+  `[](Shop& s, const Item& item) { ... }`. Parameters can be of any kind except `auto`. A lambda that
+  captures cannot be `constexpr`: make it a local, `const Component Row = [&s](std::string label) { ... };`,
+  or a session member with its signature written out:
+  `Component<VirtualNode(std::string)> Banner = [this](std::string text) { ... };`. Plain functions
+  work too (`inline constexpr Component Badge = badge;`). A function that is not wrapped still
+  works, but all its calls count as the same element, told apart only by their order.
+- **Lists.** The items of a range are told apart by their position. When items can move, or come and
+  go in the middle, give each one `attr::Key`, a string or an integer unique among its siblings, and
+  each keeps its element. A key says which element it is whichever line made it, so an item drawn
+  by another branch of a conditional keeps its element too. `Map(items, [](const T& item) { ... })`, which may also take the index, and
+  `Loop(n, [](std::size_t i) { ... })` are Volt's `map` and `loop`.
+- **Ids.** An element with `attr::Id` is the same element wherever it is on the page, also under
+  another parent: it moves there with everything in it. A new id makes it a new element, and so does
+  a new key, which is how to start an element over (`tag::Form[attr::Key = s.userId](...)`). Ids must
+  be unique; volt2 warns in the console when two elements share one, and when two siblings share a
+  key.
+- **Form controls.** `attr::Value`, `attr::Checked` and `attr::Selected` also set what the control
+  shows, each time your rendered value changes. An `OnInput` handler that stores the text renders the
+  same text back, which leaves the caret where it is.
+- **Focus.** When elements reorder, the others move around the one holding the focus. An element that
+  has to move anyway, such as one with an id going to another parent, gets its focus and selection
+  back.
 
 ## Talking to JavaScript directly
 
@@ -188,19 +233,15 @@ errors and handle lifetimes behave identically. Only the transport differs:
   sends its questions back as the reply to that request. Whoever waits keeps serving the other
   side, which is what lets calls nest. See [the experiment that proved it](experiments/sync-bridge/README.md).
 
-Rendering sends the whole tree in one message and `volt2.js` builds the elements. Events use one
-listener per event type on the root element, which sends C++ the elements with handlers, from the
-target upward, in one call; C++ runs their handlers and renders once.
+Rendering compares the new tree with the last one and sends only the differences, in one message,
+or none when nothing changed; `volt2.js` applies them, moving as few elements as it can. Events use
+one listener per event type on the root element, which sends C++ the elements with handlers, from
+the target upward, in one call; C++ runs their handlers and renders once.
 
 ## Current behaviour and limits
 
-- **Every render rebuilds the page's elements.** Identity preservation (Volt's diff) comes later, so
-  for now a render loses focus, selection, scroll positions inside elements, and text typed into an
-  input that the render recreates. An `OnInput` handler therefore interrupts typing after each
-  character, and elements re-fire their own events such as `load` (which is why those don't render
-  by themselves).
-- In development every operation is a round trip to the page, about 2 ms in our tests; a render or
-  an event is one or two.
+- In development every operation is a round trip to the page, about 2 ms in our tests; an event
+  and the render after it are one or two.
 - Reloading the page runs your site again from scratch with a new session. A second tab replaces the
   first, which is told so on its next call. (One page at a time for now.)
 - Your site and every handler run on the thread that called `volt2::run`, one at a time, like
@@ -210,7 +251,7 @@ target upward, in one call; C++ runs their handlers and renders once.
 
 ## Tests
 
-`tests/run.sh` builds four programs every way the machine supports and runs their browser tests
+`tests/run.sh` builds five programs every way the machine supports and runs their browser tests
 against each build:
 
 | Program | Browser tests |
@@ -218,11 +259,13 @@ against each build:
 | `examples/counter` | `counter`: rendering, events, conditionals, lists |
 | `tests/markup` | `markup`: attributes, text, bubbling, `preventDefault`, event values, sessions |
 | `tests/bridge` | `bridge`, `reload`: calls in both directions, errors, page reloads and tabs |
-| `tests/lifetime` | `lifetime`: functions, identity, threads, leak warnings |
+| `tests/lifetime` | `lifetime`: functions, object identity, threads, leak warnings |
+| `tests/identity` | `identity`: typing, keys, ids, components, focus, form controls, minimal updates |
 
 The builds are g++, clang, ThreadSanitizer, AddressSanitizer with UndefinedBehaviorSanitizer,
 WebAssembly (with Emscripten activated), and the Windows build via MinGW and Wine when installed.
-It also checks that C++20 is refused with a clear message. It needs Node and Playwright:
+It also checks that C++20, and the mistakes described above, are refused with a clear message. It
+needs Node and Playwright:
 
 ```bash
 npm install
@@ -235,11 +278,11 @@ After editing `web/volt2.js`, run `python3 tools/embed_js.py` to update the copy
 ## Roadmap
 
 1. ~~The bridge, on both builds~~, with ~~lifetimes~~
-2. ~~Markup and sessions~~ (this version)
-3. Async: awaiting JavaScript promises with C++20 coroutines, and JavaScript awaiting C++
-4. Identity preservation: port Volt's diff, so renders keep elements, focus and typed text
+2. ~~Markup and sessions~~
+3. ~~Identity: renders keep elements, focus and typed text~~ (this version)
+4. Async: awaiting JavaScript promises with C++20 coroutines, and JavaScript awaiting C++
 5. Browser APIs: timers, fetch, storage, console, each driven by JavaScript callbacks
-6. State: change tracking and shared memory for sessions
+6. State: change tracking, state per component (`volt2::local`), and shared memory for sessions
 7. Deploy tooling and CI for both builds
 
 ## License

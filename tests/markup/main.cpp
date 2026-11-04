@@ -8,7 +8,7 @@
 
 using namespace volt2;
 
-// A 1x1 GIF: loads instantly, and fires load again each time a render recreates the image.
+// A 1x1 GIF: loads instantly.
 constexpr const char* kPixel = "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
 
 struct Markup : Session {
@@ -97,8 +97,8 @@ VirtualNode site(Markup& s) {
             throw std::runtime_error("handler failed");
         })]("throw"),
 
-        // An element's own events (here load) do not render by themselves, so they cannot
-        // loop; invalidate() renders when the state really changed.
+        // An element's own event (here load) renders like any other, without looping, and
+        // invalidate() inside a handler does not render twice.
         tag::Img[attr::Id = "img", attr::Src = kPixel, event::OnLoad([&s] {
             ++s.loads;
             if (!s.imageLoaded) {
