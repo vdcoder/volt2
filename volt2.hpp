@@ -10,6 +10,28 @@
 //   VOLT2_NO_BROWSER=1  do not open the browser
 //   VOLT2_WARN_AT=500   warn once C++ holds this many JavaScript values or functions
 //                       (default 10000; the threshold doubles after each warning)
+//
+// Contents. Each part starts with a banner of "// ====" lines and the title below; the
+// names next to it are what to search for inside it.
+//
+//   JSON                   the messages between C++ and the page: class Json
+//   js::Value              a JavaScript value seen from C++: class Value, class Function
+//   Runtime state          class Session, struct Options, struct Runtime, request (C++ calls
+//                          the page), serveCall (the page calls C++), makeFunction, intern
+//                          and releaseHandle (lifetimes), noticeGrowth (leak warnings)
+//   Markup                 identity at creation: mixId, callScope, ComponentScope
+//                          the language: class VirtualNode, None, struct Children (what a
+//                          child can be), FirstChild and FirstProp (call sites), class
+//                          Element, class Tag, class Component, Map, Loop
+//                          names: namespace tag, class BasicAttribute, namespace attr
+//                          (KeyName is attr::Key), namespace event
+//   Rendering              class Renderer: renderNow (one render, and the patch format),
+//                          assignPaths (each element's full path), children, update and
+//                          create (the diff), dispatch (events); startPage; run
+//   The page client        web/volt2.js, embedded by tools/embed_js.py: do not edit here
+//   Development backend    the HTTP server and the synchronous bridge: class Bridge,
+//                          serveConnection, openBrowser, runSite
+//   WebAssembly backend    the module's side of the page client: wasmDispatch, runSite
 #pragma once
 
 // volt2 needs C++23: its markup, tag::Div[attr::Id = "x", attr::Class = "y"](...), uses
