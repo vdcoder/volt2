@@ -159,19 +159,21 @@ the same place, made it:
 - **Lists.** The items of a range are told apart by their position. When items can move, or come and
   go in the middle, give each one `attr::Key`, a string or an integer unique among its siblings, and
   each keeps its element. A key says which element it is whichever line made it, so an item drawn
-  by another branch of a conditional keeps its element too. `Map(items, [](const T& item) { ... })`, which may also take the index, and
+  by another branch of a conditional keeps its element too, and a new key starts an element over
+  (`tag::Form[attr::Key = s.userId](...)`). volt2 warns in the console when two siblings share a key.
+  `Map(items, [](const T& item) { ... })`, which may also take the index, and
   `Loop(n, [](std::size_t i) { ... })` are Volt's `map` and `loop`.
-- **Ids.** An element with `attr::Id` is the same element wherever it is on the page, also under
-  another parent: it moves there with everything in it. A new id makes it a new element, and so does
-  a new key, which is how to start an element over (`tag::Form[attr::Key = s.userId](...)`). Ids must
-  be unique; volt2 warns in the console when two elements share one, and when two siblings share a
-  key.
+- **Elements stay under their parent.** An element under another parent is another element, so
+  moving one there starts it over. To keep an element, such as a playing video, through a change of
+  layout, leave it where it is and rearrange around it: with enough containers to fit either layout,
+  or with CSS. Ids are ordinary attributes, for CSS, links, labels and your JavaScript; volt2 warns
+  when two elements share one, as HTML requires them to be unique.
 - **Form controls.** `attr::Value`, `attr::Checked` and `attr::Selected` also set what the control
   shows, each time your rendered value changes. An `OnInput` handler that stores the text renders the
   same text back, which leaves the caret where it is.
 - **Focus.** When elements reorder, the others move around the one holding the focus. An element that
-  has to move anyway, such as one with an id going to another parent, gets its focus and selection
-  back.
+  has to move anyway, such as the children of a container whose tag changed, gets its focus and
+  selection back.
 
 ## Talking to JavaScript directly
 
