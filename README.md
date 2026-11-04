@@ -300,16 +300,25 @@ against each build:
 | `tests/locals` | `locals`: state per component call, keyed and unkeyed lists, when state is kept or dropped |
 
 The builds are g++, clang, ThreadSanitizer, AddressSanitizer with UndefinedBehaviorSanitizer,
-WebAssembly (with Emscripten activated), and the Windows build via MinGW and Wine when installed.
-It also checks that C++20, and the mistakes described above, are refused with a clear message, and
-prints how long a render of a 9,000-node page takes (`tests/bench`, no browser needed). It needs
-Node and Playwright:
+WebAssembly (with Emscripten activated), the Windows build via MinGW and Wine, and MSVC. It also
+checks that C++20, and the mistakes described above, are refused with a clear message, and prints
+how long a render of a 9,000-node page takes (`tests/bench`, no browser needed). It needs Node and
+Playwright:
 
 ```bash
 npm install
 npx playwright install chromium
 tests/run.sh
 ```
+
+With no arguments it runs every toolchain the machine has; name some to run only those:
+`tests/run.sh checks gcc wasm` (`checks` is the compile-time checks and the benchmark). On Windows,
+`tests/run.sh msvc` runs the MSVC Debug build from Git Bash, in a Visual Studio developer
+environment.
+
+**Continuous integration.** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs each
+toolchain as its own check on every pull request and every push to `main`: five on Linux, and
+MinGW (built and run natively) and MSVC on Windows Server 2025 with Visual Studio 2026.
 
 After editing `web/volt2.js`, run `python3 tools/embed_js.py` to update the copy inside `volt2.hpp`.
 
@@ -322,7 +331,7 @@ After editing `web/volt2.js`, run `python3 tools/embed_js.py` to update the copy
 5. Browser APIs: timers, fetch, storage, console, each driven by JavaScript callbacks
 6. State: ~~state per component (`volt2::local`)~~ (this version), change tracking, and shared memory
    for sessions
-7. Deploy tooling and CI for both builds
+7. Deploy tooling, and ~~CI for both builds~~
 
 ## License
 

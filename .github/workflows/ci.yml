@@ -1,0 +1,122 @@
+# Runs tests/run.sh on every pull request and every push to main: one job per toolchain, in
+# parallel, so each shows as its own check on the pull request.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:  # a newer push to the same branch cancels the run still going
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: ${{ matrix.toolchain }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolchain: gcc
+            run: checks gcc  # the compile-time checks and the benchmark ride along
+          - toolchain: clang
+          - toolchain: tsan
+          - toolchain: asan
+          - toolchain: wasm
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Make apt retry stalled downloads, and skip indexing manual pages
+        run: |
+          printf 'Acquire::Retries "5";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-retries
+          sudo rm -f /var/lib/man-db/auto-update
+      - name: Install Playwright and Chromium
+        timeout-minutes: 15
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+      - name: Let the sanitizers map their memory  # needed on recent kernels
+        if: matrix.toolchain == 'tsan' || matrix.toolchain == 'asan'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Install Emscripten
+        if: matrix.toolchain == 'wasm'
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.13
+      - name: Test
+        run: tests/run.sh ${{ matrix.run || matrix.toolchain }}
+      - name: Keep the logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.toolchain }}
+          path: build/tests/*.log
+
+  # The Windows build with MinGW, built and run on Windows itself (MSYS2's UCRT64 g++).
+  mingw:
+    name: mingw
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Install Playwright and Chromium
+        timeout-minutes: 15
+        run: |
+          npm install
+          npx playwright install chromium
+      - name: Install MinGW g++ (MSYS2)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          release: false  # the MSYS2 already on the machine
+          path-type: inherit  # keep Node and Windows' tools on the PATH
+          install: mingw-w64-ucrt-x86_64-gcc curl
+      - name: Test
+        shell: msys2 {0}
+        run: tests/run.sh mingw
+      - name: Keep the logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-mingw
+          path: build/tests/*.log
+
+  msvc:
+    name: msvc
+    runs-on: windows-2025  # Windows Server 2025 with Visual Studio 2026
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Install Playwright and Chromium
+        timeout-minutes: 15
+        run: |
+          npm install
+          npx playwright install chromium
+      - name: Set up the Visual Studio developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Test
+        shell: bash
+        run: tests/run.sh msvc
+      - name: Keep the logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-msvc
+          path: build/tests/*.log
