@@ -1819,11 +1819,11 @@ namespace detail {
 // rendered last and sends the page only what changed, so elements keep their DOM nodes,
 // and with them focus, typed text, scroll positions and playing media.
 //
-// An element's identity is its path: its parent's path mixed with where it was made (see
-// Tag and Component) and with its attr::Key or its position in a range. An element with an
-// id starts a path of its own, so it keeps its DOM node wherever it moves on the page. A
-// new element with the same path and tag as one already shown is that element, updated in
-// place; a text child keeps its node when it is the same text child of the same element.
+// An element's identity is its path: its parent's path mixed with its attr::Key, or with
+// where it was made (see Tag and Component) and its position in a range. A new element with
+// the same path and tag as one already shown is that element, updated in place; a text
+// child keeps its node when it is the same text child of the same element. An id is an
+// ordinary attribute: an element under another parent is another element.
 class Renderer {
 public:
     explicit Renderer(std::function<VirtualNode()> render) : render_(std::move(render)) {}
@@ -1847,7 +1847,6 @@ private:
     using Nodes = std::vector<VirtualNode>;
     using Attributes = std::vector<std::pair<std::string_view, std::string_view>>;
     static constexpr std::uint64_t kRootPath = 0x243f6a8885a308d3ull;
-    static constexpr std::uint64_t kIdPath = 0x13198a2e03707344ull;
     static constexpr std::uint64_t kKeyed = 0xa4093822299f31d0ull;
     static constexpr std::uint64_t kMount = 0;  // the number of #volt2, which holds the page
 
@@ -1881,6 +1880,7 @@ private:
         byPath_.clear();
         handlers_.clear();
         claimed_.clear();
+        ids_.clear();
 
         Json warnings = Json::array();
         assignPaths(shown_, kRootPath, base, warnings);
@@ -1908,26 +1908,23 @@ private:
 
     // Each element's path: its parent's path and its own place under that parent, which is
     // its key if it has one, or else where it was made (its call site and the component
-    // calls between its parent and it) and its position in a range. An id starts a path of
-    // its own.
+    // calls between its parent and it) and its position in a range.
     void assignPaths(Nodes& nodes, std::uint64_t parent, const CallScope& scope, Json& warnings) {
         for (VirtualNode& node : nodes) {
             if (node.kind_ != VirtualNode::Kind::Element) continue;
-            const std::string* id = attribute(node, "id");
             std::uint64_t path;
-            if (id) {
-                path = mixId(kIdPath, hashText(*id));
-            } else if (node.key_) {
+            if (node.key_) {
                 path = mixId(parent, mixId(kKeyed, hashText(*node.key_)));
             } else {
                 std::uint64_t own = mixId(callsBetween(scope, node.site_.scope), node.site_.at);
                 if (node.item_ != VirtualNode::kNoItem) own = mixId(mixId(own, 2), node.item_);
                 path = mixId(parent, own);
             }
+            if (const std::string* id = attribute(node, "id"); id && !ids_.insert(*id).second) {
+                warn(warnings, "two elements have id=\"" + *id + "\"; HTML ids must be unique on the page");
+            }
             if (!byPath_.try_emplace(path, &node).second) {
-                if (id) {
-                    warn(warnings, "two elements have id=\"" + *id + "\"; an id must be unique on the page");
-                } else if (node.key_) {
+                if (node.key_) {
                     warn(warnings, "two elements under the same parent have attr::Key = \"" + *node.key_ +
                                        "\"; a key must be unique among its siblings");
                 }
@@ -2149,6 +2146,7 @@ private:
     std::unordered_map<std::uint64_t, VirtualNode*> old_;             // while rendering: the previous tree's
     std::unordered_set<std::uint64_t> claimed_;                       // while rendering: previous nodes kept
     std::unordered_map<std::uint64_t, const VirtualNode*> handlers_;  // node number -> element with handlers
+    std::unordered_set<std::string_view> ids_;                        // while rendering: the ids seen
     std::unordered_set<std::string> warned_;
     std::uint64_t nextNumber_ = 1;
     int depth_ = 0;

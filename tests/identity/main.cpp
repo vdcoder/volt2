@@ -17,6 +17,7 @@ struct Identity : Session {
     std::vector<std::string> keyed{"a", "b", "c", "d"};
     std::vector<std::string> plain{"p1", "p2", "p3"};
     bool right = false;
+    bool wide = false;
     bool flip = false;
     bool duplicate = false;
     bool agree = false;
@@ -85,10 +86,16 @@ VirtualNode site(Identity& s) {
         tag::Button[attr::Id = "branch", event::OnClick([&s] { s.branch = !s.branch; })]("branch"),
         tag::Div[attr::Id = "dup-keys"](tag::Span[attr::Key = "k"]("one"), tag::Span[attr::Key = "k"]("two")),
 
-        // An element with an id keeps its node wherever it goes, here into another parent, with
-        // everything in it, even when a different call of the component makes it.
+        // An element under another parent is another element, even with an id: ids are
+        // ordinary attributes.
         tag::Div[attr::Id = "left"](s.right ? None : Player()),
         tag::Div[attr::Id = "right"](s.right ? Player() : None),
+
+        // A container whose tag changes is a new element, but its children keep their nodes,
+        // and a focused input among them gets its focus and selection back after the move.
+        (s.wide ? tag::Section : tag::Div)[attr::Id = "frame"](tag::Input[event::OnKeyDown([&s, enter](const Value& e) {
+            if (enter(e)) s.wide = !s.wide;
+        })]()),
 
         // Components: each call site is its own element; a plain function's calls are not.
         tag::Div[attr::Id = "cards"](s.flip ? Card("b") : Card("a")),

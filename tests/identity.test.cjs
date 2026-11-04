@@ -95,22 +95,32 @@ function check(condition, message) {
       'a keyed element made by another line is the same element');
     check(warnings.some((w) => w.includes('attr::Key = "k"')), `siblings sharing a key are reported, whichever lines made them: ${JSON.stringify(warnings)}`);
 
-    // An element with an id moves to another parent with its node, and everything in it.
+    // An element under another parent is another element, even with an id.
     await mark('#player', 'player');
-    await mark('#player input', 'input');
-    await page.click('#player input');
-    await page.keyboard.type('abc');
-    await page.$eval('#player input', (el) => el.setSelectionRange(1, 2));
-    await page.keyboard.press('Enter');
+    await page.fill('#player input', 'abc');
+    await page.press('#player input', 'Enter');
     const player = await page.evaluate(() => {
       const el = document.getElementById('player');
+      return { parent: el.parentNode.id, mark: el.__mark || null, value: el.querySelector('input').value };
+    });
+    check(player.parent === 'right' && player.mark === null && player.value === '',
+      `an element under another parent is a new element, id or not: ${JSON.stringify(player)}`);
+
+    // A container whose tag changes: its children keep their nodes and move into the new one.
+    await mark('#frame input', 'input');
+    await page.click('#frame input');
+    await page.keyboard.type('abc');
+    await page.$eval('#frame input', (el) => el.setSelectionRange(1, 2));
+    await page.keyboard.press('Enter');
+    const frame = await page.evaluate(() => {
+      const el = document.getElementById('frame');
       const input = el.querySelector('input');
-      return { parent: el.parentNode.id, mark: el.__mark, input: input.__mark || null, value: input.value,
+      return { tag: el.tagName, input: input.__mark || null, value: input.value,
                focused: document.activeElement === input, selection: [input.selectionStart, input.selectionEnd] };
     });
-    check(player.parent === 'right' && player.mark === 'player' && player.input === 'input' && player.value === 'abc',
-      `an element with an id moves to another parent with its node and its children's: ${JSON.stringify(player)}`);
-    check(player.focused && player.selection.join() === '1,2', 'a moved focused input gets its focus and selection back');
+    check(frame.tag === 'SECTION' && frame.input === 'input' && frame.value === 'abc',
+      `a container whose tag changes keeps its children's nodes: ${JSON.stringify(frame)}`);
+    check(frame.focused && frame.selection.join() === '1,2', 'a moved focused input gets its focus and selection back');
 
     // Components versus plain functions.
     await mark('#cards > div', 'first');
