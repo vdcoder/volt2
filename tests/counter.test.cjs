@@ -23,7 +23,7 @@ function check(condition, message) {
   try {
     await page.goto(url);
     await page.waitForSelector('#count', { timeout: 15000 });
-    check((await text('#count')) === 'Clicked 1 times', 'first render shows the count');  // deliberately wrong: testing the required checks
+    check((await text('#count')) === 'Clicked 0 times', 'first render shows the count');
     check((await fruits()).join(',') === 'Apple,Banana,Cherry', 'and the list from the session');
     check((await page.$('#panel')) !== null && (await page.$('#warning')) === null, 'panel open, no warning yet');
 
