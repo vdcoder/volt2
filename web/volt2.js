@@ -90,8 +90,8 @@
         return Reflect.construct(fromWire(op.o), args);
       case 'typeof':
         return typeof fromWire(op.o);
-      case 'render':
-        return render(op.k, fromWire(op.f));
+      case 'patch':
+        return patch(op);
       case 'fn': {
         const id = op.k;
         return function () {
@@ -103,54 +103,237 @@
     }
   }
 
-  // Rendering. C++ sends the whole tree (no identity preservation yet) and this builds
-  // the elements into #volt2, created at the end of <body> if the page has none. Tree
-  // nodes are strings (text) or {t: tag, a: [[name, value]...], c: [children], and for
-  // elements with handlers i: index, e: [event types]}. One capturing listener per event
-  // type on the mount sends C++ the indices of the elements with handlers for that event,
-  // from the target upward (only the target when the event does not bubble).
-  const mounts = new WeakMap(); // mount element -> { nodes, types, dispatch }
+  // Rendering. C++ keeps the tree it rendered last and sends one patch per render with
+  // what changed (see Renderer::renderNow in volt2.hpp for its format). Every DOM node
+  // volt2 made has a number; 0 is the mount, #volt2, created at the end of <body> if the
+  // page has none. One capturing listener per event type on the mount sends C++ the
+  // numbers of the elements with handlers for that event, from the target upward (only
+  // the target when the event does not bubble).
+  const nodes = new Map(); // number -> DOM node
+  const numberOf = new WeakMap(); // DOM node -> number
+  const handled = new WeakMap(); // element -> the event types it has C++ handlers for
+  let listening = new Set(); // event types the mount listens to
+  let mount = null;
+  let dispatcher = null; // C++: runs the handlers for an event
+  let patching = false; // events the patch itself causes, such as focus moving, are not sent
 
   function mountElement() {
-    let mount = document.getElementById('volt2');
-    if (!mount) {
-      mount = document.createElement('div');
-      mount.id = 'volt2';
-      document.body.appendChild(mount);
+    let element = document.getElementById('volt2');
+    if (!element) {
+      element = document.createElement('div');
+      element.id = 'volt2';
+      document.body.appendChild(element);
     }
-    return mount;
-  }
-
-  function build(node, state, mount) {
-    if (typeof node === 'string') return document.createTextNode(node);
-    const element = document.createElement(node.t);
-    for (const pair of node.a) element.setAttribute(pair[0], pair[1]);
-    if (node.e) {
-      state.nodes.set(element, { index: node.i, types: node.e });
-      for (const type of node.e) {
-        if (state.types.has(type)) continue;
-        state.types.add(type);
-        mount.addEventListener(type, function (event) { deliver(mount, event); }, true);
-      }
-    }
-    const parent = node.t === 'template' ? element.content : element; // a template's children are its content
-    for (const child of node.c) parent.appendChild(build(child, state, mount));
     return element;
   }
 
-  function render(tree, dispatch) {
-    const mount = mountElement();
-    let state = mounts.get(mount);
-    if (!state) {
-      state = { types: new Set() };
-      mounts.set(mount, state);
+  function nodeNumbered(number) {
+    const node = nodes.get(number);
+    if (node === undefined) throw new Error('volt2: the page has no node #' + number);
+    return node;
+  }
+
+  function contentOf(element) {
+    return element.tagName === 'TEMPLATE' ? element.content : element; // a template's children are its content
+  }
+
+  function patch(message) {
+    if (message.r || !mount) {
+      const element = mountElement();
+      if (element !== mount) {
+        mount = element;
+        listening = new Set();
+      }
+      nodes.clear();
+      mount.replaceChildren();
+      nodes.set(0, mount);
     }
-    state.nodes = new WeakMap();
-    state.dispatch = dispatch;
-    const content = document.createDocumentFragment();
-    if (tree !== null) content.appendChild(build(tree, state, mount));
-    mount.replaceChildren(content);
+    if (message.f) dispatcher = fromWire(message.f);
+    for (const warning of message.w || []) console.warn('volt2: ' + warning);
+    const active = document.activeElement;
+    const selection = selectionOf(active);
+    const live = [];
+    patching = true;
+    try {
+      for (const step of message.p) run(step, live);
+      for (const change of live) setLive(change[0], change[1], change[2]);
+      for (const number of message.x) forget(number);
+      // A move loses the focus; arrange avoids moving the focused element, but if it had
+      // to, the focus and the selection come back.
+      if (active && active !== document.activeElement && active.isConnected) {
+        active.focus({ preventScroll: true });
+        if (selection) {
+          try {
+            active.setSelectionRange(selection[0], selection[1], selection[2]);
+          } catch (e) {}
+        }
+      }
+    } finally {
+      patching = false;
+    }
     return undefined;
+  }
+
+  function selectionOf(element) {
+    try {
+      if (element && typeof element.selectionStart === 'number') {
+        return [element.selectionStart, element.selectionEnd, element.selectionDirection];
+      }
+    } catch (e) {} // some input types have no selection
+    return null;
+  }
+
+  function run(step, live) {
+    const node = nodeNumbered(step[1]);
+    switch (step[0]) {
+      case 'o':
+        arrange(contentOf(node), step[2].map(function (child) { return make(child, live); }));
+        break;
+      case 'a':
+        setAttribute(node, step[2], step[3], live);
+        break;
+      case 't':
+        node.nodeValue = step[2];
+        break;
+      case 'e':
+        setHandlers(node, step[2]);
+        break;
+      default:
+        throw new Error('volt2: unknown patch step ' + step[0]);
+    }
+  }
+
+  // An existing node by number, or a new one with its children.
+  function make(child, live) {
+    if (typeof child === 'number') return nodeNumbered(child);
+    let node;
+    if ('x' in child) {
+      node = document.createTextNode(child.x);
+    } else {
+      node = document.createElement(child.t);
+      for (const pair of child.a) setAttribute(node, pair[0], pair[1], live);
+      if (child.e) setHandlers(node, child.e);
+      const content = contentOf(node);
+      for (const grandchild of child.c) content.appendChild(make(grandchild, live));
+    }
+    nodes.set(child.n, node);
+    numberOf.set(node, child.n);
+    return node;
+  }
+
+  // Makes `wanted` the children of `content`, in that order, moving as few nodes as
+  // possible: a move loses focus, selection and scroll positions, and reloads iframes.
+  // Nodes that volt2 did not make stay where they are.
+  function arrange(content, wanted) {
+    const keep = new Set(wanted);
+    for (let child = content.firstChild; child; ) {
+      const next = child.nextSibling;
+      if (!keep.has(child) && numberOf.has(child)) content.removeChild(child);
+      child = next;
+    }
+    const position = new Map();
+    let index = 0;
+    for (let child = content.firstChild; child; child = child.nextSibling) position.set(child, index++);
+    const stay = staying(wanted, position);
+    let before = null;
+    for (let k = wanted.length - 1; k >= 0; k--) {
+      if (!stay[k]) content.insertBefore(wanted[k], before);
+      before = wanted[k];
+    }
+  }
+
+  // Which wanted nodes stay put: the longest run already in order, so the fewest move. The
+  // one holding the focus stays whenever it is already there, even if more must move.
+  function staying(wanted, position) {
+    const stay = new Array(wanted.length).fill(false);
+    const active = document.activeElement;
+    let pinned = -1;
+    if (active && active !== document.body) {
+      for (let k = 0; k < wanted.length && pinned < 0; k++) {
+        if (position.has(wanted[k]) && wanted[k].contains(active)) pinned = k;
+      }
+    }
+    if (pinned < 0) {
+      longestInOrder(wanted, position, 0, wanted.length, -1, Infinity, stay);
+    } else {
+      const at = position.get(wanted[pinned]);
+      stay[pinned] = true;
+      longestInOrder(wanted, position, 0, pinned, -1, at, stay);
+      longestInOrder(wanted, position, pinned + 1, wanted.length, at, Infinity, stay);
+    }
+    return stay;
+  }
+
+  // Marks the longest increasing run of current positions among wanted[from..to) that lie
+  // between low and high.
+  function longestInOrder(wanted, position, from, to, low, high, stay) {
+    const ks = [];
+    const ps = [];
+    for (let k = from; k < to; k++) {
+      const p = position.get(wanted[k]);
+      if (p !== undefined && p > low && p < high) {
+        ks.push(k);
+        ps.push(p);
+      }
+    }
+    const tails = []; // tails[length - 1]: the run of that length ending lowest
+    const previous = new Array(ks.length);
+    for (let j = 0; j < ks.length; j++) {
+      let lo = 0;
+      let hi = tails.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (ps[tails[mid]] < ps[j]) lo = mid + 1;
+        else hi = mid;
+      }
+      previous[j] = lo > 0 ? tails[lo - 1] : -1;
+      tails[lo] = j;
+    }
+    for (let j = tails.length ? tails[tails.length - 1] : -1; j >= 0; j = previous[j]) stay[ks[j]] = true;
+  }
+
+  function setAttribute(element, name, value, live) {
+    if (value === null) element.removeAttribute(name);
+    else element.setAttribute(name, value);
+    if (name === 'value' || name === 'checked' || name === 'selected') live.push([element, name, value]);
+  }
+
+  // What a form control shows is a property, which typing and clicking change; its
+  // attribute is only the starting value. So these are set as properties too, once the
+  // patch's elements are in place (a select needs its options first). An unchanged value
+  // is left alone, which keeps the caret where it is.
+  function setLive(element, name, value) {
+    const tag = element.tagName;
+    try {
+      if (name === 'value' && (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT')) {
+        const text = value === null ? '' : value;
+        if (element.value !== text) element.value = text;
+      } else if (name === 'checked' && tag === 'INPUT') {
+        element.checked = value !== null;
+      } else if (name === 'selected' && tag === 'OPTION') {
+        element.selected = value !== null;
+      }
+    } catch (e) {
+      console.error('volt2: cannot set ' + name + ' on <' + tag.toLowerCase() + '>: ' + e.message);
+    }
+  }
+
+  function setHandlers(element, types) {
+    if (types.length) handled.set(element, types);
+    else handled.delete(element);
+    for (const type of types) {
+      if (listening.has(type)) continue;
+      listening.add(type);
+      mount.addEventListener(type, deliver, true);
+    }
+  }
+
+  function forget(number) {
+    const node = nodes.get(number);
+    if (node === undefined) return;
+    nodes.delete(number);
+    numberOf.delete(node);
+    handled.delete(node);
   }
 
   // The event as one handler sees it: currentTarget is that handler's element (the real
@@ -169,19 +352,19 @@
     });
   }
 
-  function deliver(mount, event) {
-    const state = mounts.get(mount);
+  function deliver(event) {
+    if (patching || !dispatcher) return;
     const chain = [];
     const views = [];
     for (let node = event.target; node && node !== mount; node = node.parentNode) {
-      const info = state.nodes.get(node);
-      if (info && info.types.indexOf(event.type) >= 0) {
-        chain.push(info.index);
+      const types = handled.get(node);
+      if (types && types.indexOf(event.type) >= 0) {
+        chain.push(numberOf.get(node));
         views.push(eventFor(event, node));
       }
       if (!event.bubbles) break;
     }
-    if (chain.length) state.dispatch.apply(null, [JSON.stringify(chain), event.type].concat(views));
+    if (chain.length) dispatcher.apply(null, [JSON.stringify(chain), event.type].concat(views));
   }
 
   // Runs one operation for C++. Errors are returned, never thrown across the bridge.
@@ -268,6 +451,9 @@
     execJson: execJson,
     handleCount: function () {
       return handles.size;
+    },
+    nodeCount: function () {
+      return nodes.size; // DOM nodes volt2 tracks, the mount included
     },
   };
   globalThis.volt2 = api;

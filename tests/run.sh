@@ -20,6 +20,7 @@ PROGRAMS=(
     "markup tests/markup/main.cpp markup markup"
     "bridge tests/bridge/main.cpp bridge,reload bridge"
     "lifetime tests/lifetime/main.cpp lifetime lifetime"
+    "identity tests/identity/main.cpp identity identity"
 )
 port=8900
 failed=()
@@ -104,6 +105,23 @@ else
     head -5 "$OUT/bool.log"
     fail "attr::Id = true error message"
 fi
+
+# Code that must not compile, with the message that must explain why: refused <name> <code> <message>
+refused() {
+    printf '#include "volt2.hpp"\nusing namespace volt2;\n%s\nint main() {}\n' "$2" > "$OUT/$1.cpp"
+    if g++ "${FLAGS[@]}" -fsyntax-only "$OUT/$1.cpp" 2> "$OUT/$1.log"; then
+        fail "$1 was accepted"
+    elif grep -q "$3" "$OUT/$1.log"; then
+        echo "  ok: $1"
+    else
+        head -5 "$OUT/$1.log"
+        fail "$1 error message"
+    fi
+}
+
+step "identity mistakes are refused with a clear message"
+refused stored-element 'VirtualNode f() { auto b = tag::Div[attr::Id = "x"]; return b("a"); }' 'in one expression'
+refused auto-component 'inline constexpr Component C = [](auto x) { return tag::P(x); };' 'fixed parameter types'
 
 step "the README's example compiles"
 awk '/^```cpp$/{n++; if (n == 1) {f = 1; next}} f && /^```$/{exit} f' README.md > "$OUT/readme.cpp"
