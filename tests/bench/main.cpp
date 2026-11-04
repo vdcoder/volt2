@@ -14,16 +14,19 @@ using Clock = std::chrono::steady_clock;
 struct Table : Session {
     std::vector<int> rows;
     int tick = 0;
+    bool withState = false;  // each row keeps a local() value
 };
 
 inline constexpr Component Row = [](Table& s, int row) {
+    if (s.withState) ++local(0);
     return tag::Tr[attr::Key = row](tag::Td(row), tag::Td[attr::Class = row % 2 ? "odd" : "even"]("row ", row),
                                     tag::Td(tag::Button[event::OnClick([&s, row] { s.tick += row; })]("x")));
 };
 
 VirtualNode site(Table& s) {
     return tag::Div[attr::Id = "root"](tag::P("tick ", s.tick),
-                                       tag::Table(tag::Tbody(Map(s.rows, [&s](int row) { return Row(s, row); }))));
+                                       tag::Table(tag::Tbody(Map(s.rows, [](int row) { return row; },
+                                                                 [&s](int row) { return Row(s, row); }))));
 }
 
 double milliseconds(Clock::time_point since) { return std::chrono::duration<double, std::milli>(Clock::now() - since).count(); }
@@ -46,12 +49,18 @@ int main() {
             detail::Renderer::Patch patch = r.diff();
             total += milliseconds(start);
             bytes = patch.steps.size() + patch.unused.size();
-            start = Clock::now();
-            VirtualNode tree = site(s);
-            build += milliseconds(start);
+            if (!s.withState) {  // local() needs a render: then the site alone is not measured
+                start = Clock::now();
+                VirtualNode tree = site(s);
+                build += milliseconds(start);
+            }
         }
-        std::printf("  %-28s %6.2f ms  (site %5.2f, compare and write %5.2f)  %7zu bytes\n", what, total / times,
-                    build / times, (total - build) / times, bytes);
+        if (build > 0) {
+            std::printf("  %-32s %6.2f ms  (site %5.2f, compare and write %5.2f)  %7zu bytes\n", what, total / times,
+                        build / times, (total - build) / times, bytes);
+        } else {
+            std::printf("  %-32s %6.2f ms                                      %7zu bytes\n", what, total / times, bytes);
+        }
     };
     std::printf("  one render of %zu rows, averaged (g++ -O2 on this machine):\n", s.rows.size());
     for (int i = 0; i < 3; ++i) site(s);  // warm up
@@ -63,4 +72,8 @@ int main() {
     measure("remove a row in the middle", 20, [&] { s.rows.erase(s.rows.begin() + static_cast<long>(s.rows.size() / 2)); });
     measure("reverse all rows", 20, [&] { std::ranges::reverse(s.rows); });
     measure("nothing changed", 50, [] {});
+    s.withState = true;
+    renderer.diff();
+    measure("same, each row with local()", 50, [] {});
+    measure("reverse, each row with local()", 20, [&] { std::ranges::reverse(s.rows); });
 }

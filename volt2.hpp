@@ -19,7 +19,9 @@
 //   Runtime state          class Session, struct Options, struct Runtime, request (C++ calls
 //                          the page), serveCall (the page calls C++), makeFunction, intern
 //                          and releaseHandle (lifetimes), noticeGrowth (leak warnings)
-//   Markup                 identity at creation: mixId, callScope, ComponentScope
+//   Markup                 identity at creation: mixId, struct CallSite, callScope
+//                          state: struct Circle (a component call), struct Circles (a
+//                          page's), ComponentScope and ItemScope, local
 //                          the language: class VirtualNode, None, struct Children (what a
 //                          child can be), FirstChild and FirstProp (call sites), class
 //                          Element, class Tag, class Component, Map, Loop
@@ -70,6 +72,7 @@
 #include <string_view>
 #include <thread>
 #include <type_traits>
+#include <typeinfo>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1192,25 +1195,40 @@ inline constexpr bool dependentFalse = false;
 // Identity. Every element remembers where in your code it was made: the call site of its
 // tag, and the component calls it was made in. Renders use it to keep each element's DOM
 // node, so focus, typed text and scroll positions stay.
-inline std::uint64_t mixBits(std::uint64_t h) {  // splitmix64's finalizer
+constexpr std::uint64_t mixBits(std::uint64_t h) {  // splitmix64's finalizer
     h ^= h >> 30;
     h *= 0xbf58476d1ce4e5b9ull;
     h ^= h >> 27;
     h *= 0x94d049bb133111ebull;
     return h ^ (h >> 31);
 }
-inline std::uint64_t mixId(std::uint64_t seed, std::uint64_t value) { return mixBits(seed ^ mixBits(value + 0x9e3779b97f4a7c15ull)); }
+constexpr std::uint64_t mixId(std::uint64_t seed, std::uint64_t value) { return mixBits(seed ^ mixBits(value + 0x9e3779b97f4a7c15ull)); }
 inline std::uint64_t hashText(std::string_view text) {
     std::uint64_t h = 0xcbf29ce484222325ull;  // FNV-1a
     for (unsigned char c : text) h = (h ^ c) * 0x100000001b3ull;
     return mixBits(h);
 }
-// A call site is its file (the name's address, the same every time that code runs), line
-// and column.
-inline std::uint64_t siteHash(const std::source_location& at) {
-    std::uint64_t h = mixId(0x452821e638d01377ull, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(at.file_name())));
-    return mixId(h, (static_cast<std::uint64_t>(at.line()) << 32) | at.column());
-}
+// A call site: where in the code, and a hash of its file name, line and column worked out
+// by the compiler, so it costs nothing when the code runs and is the same on every run.
+// Made from std::source_location::current() in a default argument:
+// `detail::CallSite at = detail::CallSite(std::source_location::current())`. Small on
+// purpose (16 bytes with g++ and clang): it is passed along with every element.
+struct CallSite {
+    std::source_location where;
+    std::uint64_t hash = 0;
+
+    constexpr CallSite() = default;
+    consteval explicit CallSite(std::source_location at) : where(at), hash(0xcbf29ce484222325ull) {
+        for (const char* c = at.file_name(); *c; ++c) hash = (hash ^ static_cast<unsigned char>(*c)) * 0x100000001b3ull;
+        hash = mixId(hash, (static_cast<std::uint64_t>(at.line()) << 32) | at.column());
+    }
+    // The same place in the code. File names compare as text: each translation unit may have
+    // its own copy of a name.
+    friend bool operator==(const CallSite& a, const CallSite& b) {
+        return a.hash == b.hash && a.where.line() == b.where.line() && a.where.column() == b.where.column() &&
+               (a.where.file_name() == b.where.file_name() || std::strcmp(a.where.file_name(), b.where.file_name()) == 0);
+    }
+};
 
 // The component calls in progress, as a chain: chain * base + call, for each call, and
 // how many. Kept this way, the calls of one chain below another can be taken out exactly
@@ -1228,14 +1246,10 @@ inline CallScope& callScope() {
 
 // Where an element was made: its tag's call site, inside these component calls.
 struct Site {
-    const char* file = nullptr;
-    std::uint32_t line = 0;
-    std::uint32_t column = 0;
+    CallSite at;
     CallScope scope;
 };
-inline Site siteOf(const std::source_location& at) {
-    return {at.file_name(), static_cast<std::uint32_t>(at.line()), static_cast<std::uint32_t>(at.column()), callScope()};
-}
+inline Site siteOf(const CallSite& at) { return {at, callScope()}; }
 
 // The calls in `inner` below `outer`: for an element made in its parent's arguments, the
 // component calls between the two. An element made elsewhere and passed in (a node given to
@@ -1250,18 +1264,197 @@ inline std::uint64_t callsBetween(const CallScope& outer, const CallScope& inner
     return mixId(0x8000000000000000ull | (outer.depth - inner.depth), inner.chain * power - outer.chain);
 }
 
-// Elements made while one is alive are made inside that component call.
+// ---- State: the circles that local() values live in
+
+// A local() value, of any type.
+struct LocalValue {
+    virtual ~LocalValue() = default;
+};
+template <class T>
+struct LocalOf final : LocalValue {
+    explicit LocalOf(T initial) : value(std::move(initial)) {}
+    T value;
+};
+
+// A component call (or an item of Map or Loop), kept from one render to the next for as long
+// as it is called: its local() values live here. A call is known by where it is made and
+// inside which call, exactly, so its state is found while it runs, before its elements
+// exist. Calls that a render does not make are dropped after it, with their state.
+struct Circle {
+    struct Local {
+        CallSite at;
+        unsigned seen = 0;
+        const std::type_info* type = nullptr;
+        std::unique_ptr<LocalValue> value;
+    };
+
+    Circle* parent = nullptr;
+    CallSite at;                      // the call, or an item's Map or Loop
+    std::optional<std::string> key;   // an item's key
+    std::size_t index = 0;            // an item's position, when it has no key
+    std::uint64_t hash = 0;           // of the above, to find it among its siblings
+    unsigned seen = 0;                // the last render that called it
+    bool twice = false;               // called more than once in that render (reported)
+    std::size_t nextChild = 0;        // where the next call is looked for first: right after the last
+    std::size_t nextLocal = 0;
+    std::vector<std::unique_ptr<Circle>> children;
+    std::vector<Local> locals;
+    std::vector<std::pair<std::uint64_t, std::size_t>> lookup;  // children by hash, when out of order
+    unsigned lookupBuilt = 0;
+
+    bool is(const CallSite& site, const std::string* itemKey, std::size_t itemIndex) const {
+        if (!(at == site)) return false;
+        if (itemKey) return key && *key == *itemKey;
+        return !key && index == itemIndex;
+    }
+    // Where this call is: site > main.cpp:40 > main.cpp:12 [key "a"].
+    std::string path() const {
+        std::string out = parent ? parent->path() : "site";
+        if (!parent) return out;
+        const char* file = at.where.file_name();
+        const char* name = std::strrchr(file, '/');
+        if (const char* back = std::strrchr(file, '\\'); back && (!name || back > name)) name = back;
+        out += " > " + std::string(name ? name + 1 : file) + ":" + std::to_string(at.where.line());
+        if (key) out += " [key \"" + *key + "\"]";
+        return out;
+    }
+};
+
+// The component calls in progress while the page renders (and Map and Loop items): only
+// their places, cheap to keep. Their circles are found when a local() needs them.
+struct Frame {
+    const CallSite* at;
+    const std::string* key;
+    std::size_t index;
+    Circle* circle;  // once found
+};
+
+// The circles of one page, and the render in progress.
+struct Circles {
+    Circle root;
+    unsigned generation = 0;
+    std::vector<Frame> frames;
+    std::vector<std::string> warnings;  // for the console, after the render
+    std::unordered_set<std::string> warned;
+
+    void warn(std::string message) {
+        if (warned.insert(message).second) warnings.push_back(std::move(message));
+    }
+
+    // The circle of the innermost call in progress, found (or made) along with the ones
+    // around it that are not found yet.
+    Circle* current() {
+        std::size_t i = frames.size();
+        while (i > 0 && !frames[i - 1].circle) --i;
+        Circle* circle = i ? frames[i - 1].circle : &root;
+        for (; i < frames.size(); ++i) circle = frames[i].circle = enter(*circle, frames[i]);
+        return circle;
+    }
+
+    // After a render: what it did not reach is gone.
+    void sweep(Circle& circle) {
+        std::erase_if(circle.locals, [&](const Circle::Local& local) { return local.seen != generation; });
+        std::erase_if(circle.children, [&](const std::unique_ptr<Circle>& child) { return child->seen != generation; });
+        circle.lookupBuilt = 0;
+        for (auto& child : circle.children) sweep(*child);
+    }
+
+private:
+    // The circle of a call made inside `parent`, found or new.
+    Circle* enter(Circle& parent, const Frame& frame) {
+        const CallSite& at = *frame.at;
+        const std::string* key = frame.key;
+        const std::size_t index = frame.index;
+        auto& children = parent.children;
+        const std::uint64_t hash = mixId(at.hash, key ? hashText(*key) : index);
+        Circle* found = nullptr;
+        std::size_t position = parent.nextChild;
+        if (position < children.size() && children[position]->hash == hash && children[position]->is(at, key, index)) {
+            found = children[position].get();
+        } else {
+            if (parent.lookupBuilt != generation) {  // out of order: look them up, built once per render
+                parent.lookup.clear();
+                for (std::size_t i = 0; i < children.size(); ++i) parent.lookup.emplace_back(children[i]->hash, i);
+                std::ranges::sort(parent.lookup);
+                parent.lookupBuilt = generation;
+            }
+            auto it = std::ranges::lower_bound(parent.lookup, std::pair<std::uint64_t, std::size_t>(hash, 0));
+            for (; it != parent.lookup.end() && it->first == hash; ++it) {
+                if (children[it->second]->is(at, key, index)) {
+                    found = children[it->second].get();
+                    position = it->second;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            auto circle = std::make_unique<Circle>();
+            circle->parent = &parent;
+            circle->at = at;
+            if (key) circle->key = *key;
+            circle->index = index;
+            circle->hash = hash;
+            found = circle.get();
+            position = children.size();
+            children.push_back(std::move(circle));
+            if (parent.lookupBuilt == generation) {  // already looked up this render: it must find this one too
+                const std::pair<std::uint64_t, std::size_t> entry(hash, position);
+                parent.lookup.insert(std::ranges::lower_bound(parent.lookup, entry), entry);
+            }
+        } else if (found->seen == generation) {
+            found->twice = true;
+            warn("the same component call ran twice in one render, at " + found->path() +
+                 "; its local() values are shared. For lists, use Map");
+        }
+        parent.nextChild = position + 1;
+        if (found->seen != generation) {
+            found->seen = generation;
+            found->twice = false;
+            found->nextChild = 0;
+            found->nextLocal = 0;
+        }
+        return found;
+    }
+};
+inline Circles*& currentCircles() {
+    thread_local Circles* circles = nullptr;
+    return circles;
+}
+
+// While one is alive, elements are made inside that component call, and local() finds that
+// call's state.
 class ComponentScope {
 public:
-    explicit ComponentScope(const std::source_location& at) : outer_(callScope()) {
-        callScope() = {outer_.chain * kChainBase + siteHash(at), outer_.depth + 1};
+    explicit ComponentScope(const CallSite& at) : outer_(callScope()), circles_(currentCircles()) {
+        callScope() = {outer_.chain * kChainBase + at.hash, outer_.depth + 1};
+        if (circles_) circles_->frames.push_back({&at, nullptr, 0, nullptr});
     }
-    ~ComponentScope() { callScope() = outer_; }
+    ~ComponentScope() {
+        callScope() = outer_;
+        if (circles_) circles_->frames.pop_back();
+    }
     ComponentScope(const ComponentScope&) = delete;
     ComponentScope& operator=(const ComponentScope&) = delete;
 
 private:
     CallScope outer_;
+    Circles* circles_;
+};
+
+// One item of Map or Loop: a call of its own, named by its key or position.
+class ItemScope {
+public:
+    ItemScope(const CallSite& at, const std::string* key, std::size_t index) : circles_(currentCircles()) {
+        if (circles_) circles_->frames.push_back({&at, key, index, nullptr});
+    }
+    ~ItemScope() {
+        if (circles_) circles_->frames.pop_back();
+    }
+    ItemScope(const ItemScope&) = delete;
+    ItemScope& operator=(const ItemScope&) = delete;
+
+private:
+    Circles* circles_;
 };
 
 }  // namespace detail
@@ -1377,6 +1570,9 @@ struct Children {
         }
     }
     static std::vector<VirtualNode>& children(VirtualNode& node) { return node.children_; }
+    static void giveKey(VirtualNode& node, const std::string& key) {
+        if (node.kind_ == VirtualNode::Kind::Element && !node.key_) node.key_ = key;
+    }
 };
 
 }  // namespace detail
@@ -1431,7 +1627,7 @@ namespace detail {
 class FirstChild {
 public:
     template <Child T>
-    FirstChild(T&& child, std::source_location at = std::source_location::current()) : site_(siteOf(at)) {
+    FirstChild(T&& child, CallSite at = CallSite(std::source_location::current())) : site_(siteOf(at)) {
         Children::append(nodes_, std::forward<T>(child));
     }
     FirstChild(const FirstChild&) = delete;
@@ -1448,7 +1644,7 @@ private:
 class FirstProp {
 public:
     template <PropLike T>
-    FirstProp(T&& prop, std::source_location at = std::source_location::current())
+    FirstProp(T&& prop, CallSite at = CallSite(std::source_location::current()))
         : site_(siteOf(at)), prop_(std::forward<T>(prop)) {}
     FirstProp(const FirstProp&) = delete;
     FirstProp(FirstProp&&) = delete;
@@ -1502,7 +1698,7 @@ class Tag {
 public:
     constexpr explicit Tag(std::string_view name) : name_(name) {}
 
-    Element operator[](std::source_location at = std::source_location::current()) const {
+    Element operator[](detail::CallSite at = detail::CallSite(std::source_location::current())) const {
         return Element(name_, detail::siteOf(at), {});
     }
     template <PropLike... P>
@@ -1517,7 +1713,7 @@ public:
         return Element(name_, first.site_, std::move(list));
     }
 
-    VirtualNode operator()(std::source_location at = std::source_location::current()) const {
+    VirtualNode operator()(detail::CallSite at = detail::CallSite(std::source_location::current())) const {
         return detail::Children::element(name_, detail::siteOf(at), {});
     }
     template <Child... C>
@@ -1569,7 +1765,7 @@ template <class F, class R, bool N, class... P>
 class Component<F, R (F::*)(P...) const noexcept(N)> {
 public:
     constexpr Component(F body) : body_(std::move(body)) {}
-    R operator()(P... args, std::source_location at = std::source_location::current()) const noexcept(N) {
+    R operator()(P... args, detail::CallSite at = detail::CallSite(std::source_location::current())) const noexcept(N) {
         detail::ComponentScope scope(at);
         return body_(std::forward<P>(args)...);
     }
@@ -1583,7 +1779,7 @@ template <class F, class R, bool N, class... P>
 class Component<F, R (*)(P...) noexcept(N)> {
 public:
     constexpr Component(F) {}
-    R operator()(P... args, std::source_location at = std::source_location::current()) const noexcept(N) {
+    R operator()(P... args, detail::CallSite at = detail::CallSite(std::source_location::current())) const noexcept(N) {
         detail::ComponentScope scope(at);
         return F::operator()(std::forward<P>(args)...);
     }
@@ -1594,7 +1790,7 @@ template <class R, bool N, class... P>
 class Component<R (*)(P...) noexcept(N), void> {
 public:
     constexpr Component(R (*body)(P...) noexcept(N)) : body_(body) {}
-    R operator()(P... args, std::source_location at = std::source_location::current()) const noexcept(N) {
+    R operator()(P... args, detail::CallSite at = detail::CallSite(std::source_location::current())) const noexcept(N) {
         detail::ComponentScope scope(at);
         return body_(std::forward<P>(args)...);
     }
@@ -1610,7 +1806,7 @@ public:
     template <class G>
         requires std::is_invocable_r_v<R, G&, P...>
     Component(G body) : body_(std::move(body)) {}
-    R operator()(P... args, std::source_location at = std::source_location::current()) const {
+    R operator()(P... args, detail::CallSite at = detail::CallSite(std::source_location::current())) const {
         detail::ComponentScope scope(at);
         return body_(std::forward<P>(args)...);
     }
@@ -1622,20 +1818,65 @@ private:
 template <class F>
 Component(F) -> Component<F>;
 
+namespace detail {
+template <class R, class F>
+concept ItemMaker = std::invocable<F&, std::ranges::range_reference_t<R>> ||
+                    std::invocable<F&, std::ranges::range_reference_t<R>, std::size_t>;
+
+template <class F, class Item>
+VirtualNode makeItem(F& make, Item&& item, std::size_t index) {
+    if constexpr (std::invocable<F&, Item, std::size_t>) {
+        return make(std::forward<Item>(item), index);
+    } else {
+        return make(std::forward<Item>(item));
+    }
+}
+
+template <class K>
+std::string keyText(const K& key) {
+    if constexpr (std::convertible_to<const K&, std::string_view>) {
+        return std::string(std::string_view(key));
+    } else {
+        static_assert(std::integral<K> && !std::same_as<K, bool>, "volt2::Map: a key is a string or an integer");
+        return std::to_string(key);
+    }
+}
+}  // namespace detail
+
 // One node per item, like Volt's map: Map(s.fruits, [&](const std::string& fruit) {...}).
 // The function may also take the item's index: [&](const std::string& fruit, std::size_t i).
-// Items are told apart by position; give each an attr::Key when the list can reorder.
+// Each item is a call of its own: the components it calls keep their own local() state.
+// Items are told apart by position; give them a key when the list can reorder (below).
 template <std::ranges::input_range R, class F>
-std::vector<VirtualNode> Map(R&& items, F&& make) {
+    requires detail::ItemMaker<R, F>
+std::vector<VirtualNode> Map(R&& items, F&& make, detail::CallSite at = detail::CallSite(std::source_location::current())) {
     std::vector<VirtualNode> nodes;
     if constexpr (std::ranges::sized_range<R>) nodes.reserve(std::ranges::size(items));
     std::size_t index = 0;
     for (auto&& item : items) {
-        if constexpr (std::invocable<F&, std::ranges::range_reference_t<R>, std::size_t>) {
-            nodes.push_back(make(std::forward<decltype(item)>(item), index));
-        } else {
-            nodes.push_back(make(std::forward<decltype(item)>(item)));
-        }
+        detail::ItemScope scope(at, nullptr, index);
+        nodes.push_back(detail::makeItem(make, std::forward<decltype(item)>(item), index));
+        ++index;
+    }
+    return nodes;
+}
+
+// The same with a key for each item, a string or an integer, unique in the list:
+// Map(s.todos, &Todo::id, [&](const Todo& todo) {...}), or any function of the item for the
+// key. Each item's element gets it as its attr::Key, and its components' local() state goes
+// with the item when the list reorders.
+template <std::ranges::input_range R, class K, class F>
+    requires std::invocable<K&, std::ranges::range_reference_t<R>> && detail::ItemMaker<R, F>
+std::vector<VirtualNode> Map(R&& items, K&& key, F&& make,
+                             detail::CallSite at = detail::CallSite(std::source_location::current())) {
+    std::vector<VirtualNode> nodes;
+    if constexpr (std::ranges::sized_range<R>) nodes.reserve(std::ranges::size(items));
+    std::size_t index = 0;
+    for (auto&& item : items) {
+        const std::string name = detail::keyText(std::invoke(key, item));
+        detail::ItemScope scope(at, &name, index);
+        nodes.push_back(detail::makeItem(make, std::forward<decltype(item)>(item), index));
+        detail::Children::giveKey(nodes.back(), name);
         ++index;
     }
     return nodes;
@@ -1644,11 +1885,58 @@ std::vector<VirtualNode> Map(R&& items, F&& make) {
 // `count` nodes, like Volt's loop: Loop(3, [](std::size_t i) { return tag::Li(i); }).
 template <class F>
     requires std::invocable<F&, std::size_t>
-std::vector<VirtualNode> Loop(std::size_t count, F&& make) {
+std::vector<VirtualNode> Loop(std::size_t count, F&& make,
+                              detail::CallSite at = detail::CallSite(std::source_location::current())) {
     std::vector<VirtualNode> nodes;
     nodes.reserve(count);
-    for (std::size_t index = 0; index < count; ++index) nodes.push_back(make(index));
+    for (std::size_t index = 0; index < count; ++index) {
+        detail::ItemScope scope(at, nullptr, index);
+        nodes.push_back(make(index));
+    }
     return nodes;
+}
+
+// State of a component call, kept from one render to the next for as long as the component
+// is called (shown or not), and dropped once a render does not call it:
+//
+//     inline constexpr volt2::Component Dropdown = [](std::string label) {
+//         bool& open = volt2::local(false);
+//         return tag::Div(tag::Button[event::OnClick([&open] { open = !open; })](label),
+//                         open ? tag::Ul(...) : None);
+//     };
+//
+// Each call site of the component has its own; inside Map and Loop, each item. The initial
+// value is used the first time: volt2::local(0), volt2::local<std::string>("text"),
+// volt2::local<std::vector<int>>(). Handlers may keep the reference. Only while the page
+// renders, inside site() or a component it calls.
+template <class T>
+T& local(T initial = T{}, detail::CallSite at = detail::CallSite(std::source_location::current())) {
+    detail::Circles* circles = detail::currentCircles();
+    if (!circles) throw std::logic_error("volt2::local works while the page renders, in site() or a component it calls");
+    detail::Circle* circle = circles->current();
+    auto& locals = circle->locals;
+    detail::Circle::Local* found = nullptr;
+    if (circle->nextLocal < locals.size() && locals[circle->nextLocal].at == at) {
+        found = &locals[circle->nextLocal];
+    } else {
+        for (auto& local : locals) {
+            if (local.at == at) {
+                found = &local;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        locals.push_back({at, 0, &typeid(T), std::make_unique<detail::LocalOf<T>>(std::move(initial))});
+        found = &locals.back();
+    } else if (found->seen == circles->generation && !circle->twice) {  // a repeated call is reported already
+        circles->warn("the same local() ran twice for one component call, at " + circle->path() +
+                      "; it is shared. For lists, use Map");
+    }
+    found->seen = circles->generation;
+    circle->nextLocal = static_cast<std::size_t>(found - locals.data()) + 1;
+    if (*found->type != typeid(T)) throw std::logic_error("volt2::local: one call site, two types");
+    return static_cast<detail::LocalOf<T>&>(*found->value).value;
 }
 
 // How an attribute writes `= true` and `= false`.
@@ -1905,7 +2193,21 @@ public:
     Patch diff() {
         const CallScope base = callScope();  // the calls around site(): none
         Nodes next;
-        if (VirtualNode root = render_(); !root.isNothing()) next.push_back(std::move(root));
+        {
+            // While the site runs, component calls find their circles (local() state) in this
+            // page's; afterwards, the ones it did not call are dropped.
+            struct Using {
+                Circles* outer;
+                ~Using() { currentCircles() = outer; }
+            } restore{currentCircles()};
+            ++circles_.generation;
+            circles_.root.seen = circles_.generation;
+            circles_.root.nextChild = circles_.root.nextLocal = 0;
+            circles_.frames.clear();
+            currentCircles() = &circles_;
+            if (VirtualNode root = render_(); !root.isNothing()) next.push_back(std::move(root));
+            circles_.sweep(circles_.root);
+        }
 
         Patch patch;
         patch.reset = std::exchange(fresh_, true);  // true until this is done, so a failure starts over
@@ -1914,6 +2216,8 @@ public:
         handlers_.clear();
         ids_.clear();
         out_ = &patch;
+        for (std::string& warning : circles_.warnings) warn(warning);
+        circles_.warnings.clear();
         diffChildren(kMount, patch.reset ? nullptr : &previous, shown_, base);
         if (!patch.reset) collectUnused(previous, patch.unused);
         out_ = nullptr;
@@ -1974,8 +2278,7 @@ private:
             node.own_ = mixId(kKeyed, hashText(*node.key_));
         } else {
             node.calls_ = callsBetween(scope, node.site_.scope);
-            std::uint64_t own = mixId(mixId(node.calls_, reinterpret_cast<std::uintptr_t>(node.site_.file)),
-                                      (static_cast<std::uint64_t>(node.site_.line) << 32) | node.site_.column);
+            std::uint64_t own = mixId(node.calls_, node.site_.at.hash);
             node.own_ = node.item_ == VirtualNode::kNoItem ? own : mixId(own, node.item_);
         }
         if (const std::string* id = attribute(node, "id"); id && !ids_.insert(*id).second) {
@@ -1987,8 +2290,7 @@ private:
     static bool sameIdentity(const VirtualNode& a, const VirtualNode& b) {
         if (a.own_ != b.own_) return false;
         if (a.key_ || b.key_) return a.key_ && b.key_ && *a.key_ == *b.key_;
-        return a.site_.file == b.site_.file && a.site_.line == b.site_.line && a.site_.column == b.site_.column &&
-               a.item_ == b.item_ && a.calls_ == b.calls_;
+        return a.site_.at == b.site_.at && a.item_ == b.item_ && a.calls_ == b.calls_;
     }
 
     static bool available(const VirtualNode& old, const VirtualNode& node) {
@@ -2322,6 +2624,7 @@ private:
     std::unordered_set<std::string_view> ids_;                        // while rendering: the ids seen
     std::unordered_set<std::string> warned_;
     Patch* out_ = nullptr;  // while rendering: the patch being written
+    Circles circles_;       // the page's component calls and their local() state
     std::uint64_t nextNumber_ = 1;
     int depth_ = 0;
     bool pending_ = false;  // a render is due when the handlers finish
