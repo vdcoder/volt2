@@ -21,6 +21,7 @@ PROGRAMS=(
     "bridge tests/bridge/main.cpp bridge,reload bridge"
     "lifetime tests/lifetime/main.cpp lifetime lifetime"
     "identity tests/identity/main.cpp identity identity"
+    "diff tests/diff/main.cpp diff diff"
 )
 port=8900
 failed=()
@@ -126,6 +127,9 @@ refused auto-component 'inline constexpr Component C = [](auto x) { return tag::
 step "the README's example compiles"
 awk '/^```cpp$/{n++; if (n == 1) {f = 1; next}} f && /^```$/{exit} f' README.md > "$OUT/readme.cpp"
 build readme g++ "${FLAGS[@]}" -fsyntax-only "$OUT/readme.cpp" && echo "  ok"
+
+step "render speed (for information)"
+build bench g++ "${FLAGS[@]}" -O2 -pthread tests/bench/main.cpp -o "$OUT/bench" && { "$OUT/bench" || fail "bench"; }
 
 step "g++"
 build_all gcc "" g++ "${FLAGS[@]}" -O1 -pthread && test_native gcc ""

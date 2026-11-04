@@ -236,7 +236,9 @@ errors and handle lifetimes behave identically. Only the transport differs:
   side, which is what lets calls nest. See [the experiment that proved it](experiments/sync-bridge/README.md).
 
 Rendering compares the new tree with the last one and sends only the differences, in one message,
-or none when nothing changed; `volt2.js` applies them, moving as few elements as it can. Events use
+or none when nothing changed; `volt2.js` applies them, moving as few elements as it can. Each
+element is looked for among the old children of its parent only, first where it was, so an
+unchanged page costs one comparison per element. Events use
 one listener per event type on the root element, which sends C++ the elements with handlers, from
 the target upward, in one call; C++ runs their handlers and renders once.
 
@@ -253,7 +255,7 @@ the target upward, in one call; C++ runs their handlers and renders once.
 
 ## Tests
 
-`tests/run.sh` builds five programs every way the machine supports and runs their browser tests
+`tests/run.sh` builds six programs every way the machine supports and runs their browser tests
 against each build:
 
 | Program | Browser tests |
@@ -263,11 +265,13 @@ against each build:
 | `tests/bridge` | `bridge`, `reload`: calls in both directions, errors, page reloads and tabs |
 | `tests/lifetime` | `lifetime`: functions, object identity, threads, leak warnings |
 | `tests/identity` | `identity`: typing, keys, ids, components, focus, form controls, minimal updates |
+| `tests/diff` | `diff`: 400 random changes; after each, the page must be exactly the rendered tree |
 
 The builds are g++, clang, ThreadSanitizer, AddressSanitizer with UndefinedBehaviorSanitizer,
 WebAssembly (with Emscripten activated), and the Windows build via MinGW and Wine when installed.
-It also checks that C++20, and the mistakes described above, are refused with a clear message. It
-needs Node and Playwright:
+It also checks that C++20, and the mistakes described above, are refused with a clear message, and
+prints how long a render of a 9,000-node page takes (`tests/bench`, no browser needed). It needs
+Node and Playwright:
 
 ```bash
 npm install
