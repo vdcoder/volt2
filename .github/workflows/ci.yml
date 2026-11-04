@@ -31,12 +31,19 @@ jobs:
           - toolchain: asan
           - toolchain: wasm
           - toolchain: mingw
+    env:
+      DEBIAN_FRONTEND: noninteractive
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+      - name: Make apt retry stalled downloads, and skip indexing manual pages
+        run: |
+          printf 'Acquire::Retries "5";\nAcquire::http::Timeout "60";\nAcquire::https::Timeout "60";\n' | sudo tee /etc/apt/apt.conf.d/80-retries
+          sudo rm -f /var/lib/man-db/auto-update
       - name: Install Playwright and Chromium
+        timeout-minutes: 15
         run: |
           npm install
           npx playwright install --with-deps chromium
@@ -50,6 +57,7 @@ jobs:
           version: 6.0.13
       - name: Install MinGW and Wine
         if: matrix.toolchain == 'mingw'
+        timeout-minutes: 15
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends g++-mingw-w64-x86-64-posix wine64 wine
@@ -72,6 +80,7 @@ jobs:
         with:
           node-version: 22
       - name: Install Playwright and Chromium
+        timeout-minutes: 15
         run: |
           npm install
           npx playwright install chromium
