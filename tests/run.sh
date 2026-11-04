@@ -9,7 +9,8 @@
 #            render benchmark (g++)
 #   gcc, clang, tsan (ThreadSanitizer), asan (AddressSanitizer + UndefinedBehaviorSanitizer)
 #   wasm     em++ (Emscripten, activated), served as static files
-#   mingw    the Windows build with MinGW g++, run with wine
+#   mingw    the Windows build with MinGW g++: cross-compiled and run with wine on Linux, or
+#            built and run natively on Windows (in an MSYS2 shell)
 #   msvc     cl.exe, from Git Bash in a Visual Studio developer environment on Windows
 #
 # Needs: curl, Node with Playwright (npm install, then npx playwright install chromium), and
@@ -41,12 +42,21 @@ fail() { echo "FAILED: $1"; failed+=("$1"); }
 
 TOOLCHAINS=(checks gcc clang tsan asan wasm mingw msvc)
 SELECTED=("$@")
+windows() { [ "${OS:-}" = Windows_NT ]; }
+# MinGW: the cross compiler on Linux, or on Windows the g++ of the shell (MSYS2 UCRT64).
+mingw_compiler() {
+    if have x86_64-w64-mingw32-g++-posix; then
+        echo x86_64-w64-mingw32-g++-posix
+    elif windows && have g++; then
+        echo g++
+    fi
+}
 available() {
     case $1 in
-        checks | gcc | tsan | asan) have g++ ;;
+        checks | gcc | tsan | asan) ! windows && have g++ ;;
         clang) have clang++ ;;
         wasm) have em++ ;;
-        mingw) have x86_64-w64-mingw32-g++-posix ;;
+        mingw) [ -n "$(mingw_compiler)" ] ;;
         msvc) have cl.exe ;;
         *) return 1 ;;
     esac
@@ -239,8 +249,12 @@ fi
 
 if wanted mingw; then
     step "Windows build (MinGW)"
-    if build_all mingw .exe x86_64-w64-mingw32-g++-posix "${FLAGS[@]}" -O1 -static -lws2_32; then
-        if have wine; then
+    MINGW_CXX=$(mingw_compiler)
+    "$MINGW_CXX" --version | head -1
+    if build_all mingw .exe "$MINGW_CXX" "${FLAGS[@]}" -O1 -static -lws2_32; then
+        if windows; then
+            test_native mingw "" .exe
+        elif have wine; then
             export WINEPREFIX="${WINEPREFIX:-$PWD/build/wineprefix}" WINEDEBUG=-all
             test_native mingw wine .exe
             wineserver -k 2> /dev/null

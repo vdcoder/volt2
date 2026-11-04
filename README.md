@@ -317,8 +317,8 @@ With no arguments it runs every toolchain the machine has; name some to run only
 environment.
 
 **Continuous integration.** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs each
-toolchain as its own check on every pull request and every push to `main`: six on Linux, and MSVC
-on Windows Server 2025 with Visual Studio 2026.
+toolchain as its own check on every pull request and every push to `main`: five on Linux, and
+MinGW (built and run natively) and MSVC on Windows Server 2025 with Visual Studio 2026.
 
 After editing `web/volt2.js`, run `python3 tools/embed_js.py` to update the copy inside `volt2.hpp`.
 
