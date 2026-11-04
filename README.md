@@ -157,14 +157,15 @@ the same place, made it:
   work too (`inline constexpr Component Badge = badge;`). A function that is not wrapped still
   works, but all its calls count as the same element, told apart only by their order.
 - **Lists.** The items of a range are told apart by their position. When items can move, or come and
-  go in the middle, give each one `attr::Key`, a string or an integer unique in its list, and each
-  keeps its element. `Map(items, [](const T& item) { ... })`, which may also take the index, and
+  go in the middle, give each one `attr::Key`, a string or an integer unique among its siblings, and
+  each keeps its element. A key says which element it is whichever line made it, so an item drawn
+  by another branch of a conditional keeps its element too. `Map(items, [](const T& item) { ... })`, which may also take the index, and
   `Loop(n, [](std::size_t i) { ... })` are Volt's `map` and `loop`.
 - **Ids.** An element with `attr::Id` is the same element wherever it is on the page, also under
   another parent: it moves there with everything in it. A new id makes it a new element, and so does
   a new key, which is how to start an element over (`tag::Form[attr::Key = s.userId](...)`). Ids must
-  be unique; volt2 warns in the console when two elements share one, and when two items of a list
-  share a key.
+  be unique; volt2 warns in the console when two elements share one, and when two siblings share a
+  key.
 - **Form controls.** `attr::Value`, `attr::Checked` and `attr::Selected` also set what the control
   shows, each time your rendered value changes. An `OnInput` handler that stores the text renders the
   same text back, which leaves the caret where it is.

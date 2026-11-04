@@ -22,6 +22,8 @@ struct Identity : Session {
     bool agree = false;
     std::string color = "green";
     bool loaded = false;
+    bool branch = false;
+    std::vector<std::string> options;  // none at first
 
     // A member component, which can use the session's state.
     Component<VirtualNode(std::string)> Badge = [this](std::string text) {
@@ -45,7 +47,7 @@ VirtualNode site(Identity& s) {
 
     // A local component may capture.
     const Component Player = [&s, enter] {
-        return tag::Div[attr::Id = "player"]("player ", tag::Input[attr::Id = "player-input", event::OnKeyDown([&s, enter](const Value& e) {
+        return tag::Div[attr::Id = "player"]("player ", tag::Input[attr::Class = "player-input", event::OnKeyDown([&s, enter](const Value& e) {
             if (enter(e)) s.right = !s.right;
         })]());
     };
@@ -77,7 +79,14 @@ VirtualNode site(Identity& s) {
             std::ranges::reverse(s.plain);
         })]("reverse"),
 
-        // An element with an id keeps its node wherever it goes, here into another parent.
+        // A key says which element it is, whichever line made it, and must be unique among siblings.
+        tag::Ul[attr::Id = "branches"](s.branch ? tag::Li[attr::Key = "same"]("from one line")
+                                                : tag::Li[attr::Key = "same"]("from another line")),
+        tag::Button[attr::Id = "branch", event::OnClick([&s] { s.branch = !s.branch; })]("branch"),
+        tag::Div[attr::Id = "dup-keys"](tag::Span[attr::Key = "k"]("one"), tag::Span[attr::Key = "k"]("two")),
+
+        // An element with an id keeps its node wherever it goes, here into another parent, with
+        // everything in it, even when a different call of the component makes it.
         tag::Div[attr::Id = "left"](s.right ? None : Player()),
         tag::Div[attr::Id = "right"](s.right ? Player() : None),
 
@@ -102,6 +111,12 @@ VirtualNode site(Identity& s) {
             tag::Option[attr::Value = "blue"]("blue")),
         tag::Button[attr::Id = "blue", event::OnClick([&s] { s.color = "blue"; })]("blue"),
         tag::P[attr::Id = "color-state"](s.color),
+        // A select keeps showing its value while its options change around it.
+        tag::Select[attr::Id = "fixed", attr::Value = "green"](
+            Map(s.options, [](const std::string& option) { return tag::Option[attr::Value = option](option); })),
+        tag::Button[attr::Id = "options", event::OnClick([&s] {
+            s.options = s.options.empty() ? std::vector<std::string>{"red", "green"} : std::vector<std::string>{"green", "blue"};
+        })]("options"),
 
         // An element's own events render like any other, and do not loop.
         tag::Img[attr::Id = "img", attr::Src = kPixel, event::OnLoad([&s] { s.loaded = true; })](),

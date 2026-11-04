@@ -153,9 +153,19 @@
     const active = document.activeElement;
     const selection = selectionOf(active);
     const live = [];
+    const selects = new Set();
     patching = true;
     try {
-      for (const step of message.p) run(step, live);
+      for (const step of message.p) {
+        const select = selectAround(run(step, live));
+        if (select) selects.add(select);
+      }
+      // A select shows the option that matches its value, which can be another option once
+      // its options change: its value is applied again.
+      for (const select of selects) {
+        const value = select.getAttribute('value');
+        if (value !== null) live.push([select, 'value', value]);
+      }
       for (const change of live) setLive(change[0], change[1], change[2]);
       for (const number of message.x) forget(number);
       // A move loses the focus; arrange avoids moving the focused element, but if it had
@@ -201,6 +211,16 @@
       default:
         throw new Error('volt2: unknown patch step ' + step[0]);
     }
+    return node;
+  }
+
+  // The select a changed node belongs to: the select itself, or one of its options.
+  function selectAround(node) {
+    for (let element = node.nodeType === 1 ? node : node.parentNode; element && element.nodeType === 1; element = element.parentNode) {
+      if (element.tagName === 'SELECT') return element;
+      if (element.tagName !== 'OPTION' && element.tagName !== 'OPTGROUP') return null;
+    }
+    return null;
   }
 
   // An existing node by number, or a new one with its children.

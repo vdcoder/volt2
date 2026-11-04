@@ -88,20 +88,28 @@ function check(condition, message) {
     check(moved && after === 'cbad' && active[0] === 'd' && active[1] === 'typed', `the list rotates and the focused input keeps focus and text: ${after}, ${JSON.stringify(active)}`);
     check(!removed.includes('d'), `the focused item is not moved, the others move around it (moved: ${removed.join(',')})`);
 
-    // An element with an id moves to another parent with its node.
+    // A key, not the line that made it, says which element it is.
+    await mark('#branches li', 'same');
+    await page.click('#branch');
+    check((await text('#branches li')) === 'from one line' && (await markOf('#branches li')) === 'same',
+      'a keyed element made by another line is the same element');
+    check(warnings.some((w) => w.includes('attr::Key = "k"')), `siblings sharing a key are reported, whichever lines made them: ${JSON.stringify(warnings)}`);
+
+    // An element with an id moves to another parent with its node, and everything in it.
     await mark('#player', 'player');
-    await page.click('#player-input');
+    await mark('#player input', 'input');
+    await page.click('#player input');
     await page.keyboard.type('abc');
-    await page.$eval('#player-input', (el) => el.setSelectionRange(1, 2));
+    await page.$eval('#player input', (el) => el.setSelectionRange(1, 2));
     await page.keyboard.press('Enter');
     const player = await page.evaluate(() => {
       const el = document.getElementById('player');
-      const input = document.getElementById('player-input');
-      return { parent: el.parentNode.id, mark: el.__mark, value: input.value, focused: document.activeElement === input,
-               selection: [input.selectionStart, input.selectionEnd] };
+      const input = el.querySelector('input');
+      return { parent: el.parentNode.id, mark: el.__mark, input: input.__mark || null, value: input.value,
+               focused: document.activeElement === input, selection: [input.selectionStart, input.selectionEnd] };
     });
-    check(player.parent === 'right' && player.mark === 'player' && player.value === 'abc',
-      `an element with an id moves to another parent with its node: ${JSON.stringify(player)}`);
+    check(player.parent === 'right' && player.mark === 'player' && player.input === 'input' && player.value === 'abc',
+      `an element with an id moves to another parent with its node and its children's: ${JSON.stringify(player)}`);
     check(player.focused && player.selection.join() === '1,2', 'a moved focused input gets its focus and selection back');
 
     // Components versus plain functions.
@@ -122,7 +130,7 @@ function check(condition, message) {
     // Duplicate ids.
     await page.click('#duplicate');
     check((await page.$$('#dups span')).length === 2, 'two elements with the same id both render');
-    check(warnings.some((w) => w.includes('two elements have id="dup"')), `and the console says so: ${JSON.stringify(warnings)}`);
+    check(warnings.some((w) => w.includes('two elements have id="dup"')), 'and the console says so');
 
     // Form controls.
     await page.click('#agree');
@@ -134,6 +142,10 @@ function check(condition, message) {
     check((await value('#color')) === 'blue', 'and follows the state');
     await page.selectOption('#color', 'red');
     check((await text('#color-state')) === 'red' && (await value('#color')) === 'red', 'and the user can choose');
+    await page.click('#options');
+    check((await value('#fixed')) === 'green', `a select shows its value once its options arrive: "${await value('#fixed')}"`);
+    await page.click('#options');
+    check((await value('#fixed')) === 'green', `and while its options change around it: "${await value('#fixed')}"`);
 
     // A render where only the render count changes touches only the two texts showing it.
     const records = await page.evaluate(async () => {

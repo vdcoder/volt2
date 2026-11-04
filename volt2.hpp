@@ -1184,8 +1184,8 @@ template <class...>
 inline constexpr bool dependentFalse = false;
 
 // Identity. Every element remembers where in your code it was made: the call site of its
-// tag, mixed with the call sites of the components it was made in (the scope). Renders
-// use it to keep each element's DOM node, so focus, typed text and scroll positions stay.
+// tag, and the component calls it was made in. Renders use it to keep each element's DOM
+// node, so focus, typed text and scroll positions stay.
 inline std::uint64_t mixBits(std::uint64_t h) {  // splitmix64's finalizer
     h ^= h >> 30;
     h *= 0xbf58476d1ce4e5b9ull;
@@ -1200,27 +1200,58 @@ inline std::uint64_t hashText(std::string_view text) {
     return mixBits(h);
 }
 // A call site is its file (the name's address, the same every time that code runs), line
-// and column. Mixed into 64 bits: two siblings colliding is a one in 10^19 chance.
-inline std::uint64_t mixSite(std::uint64_t seed, const std::source_location& at) {
-    std::uint64_t h = mixId(seed, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(at.file_name())));
+// and column.
+inline std::uint64_t siteHash(const std::source_location& at) {
+    std::uint64_t h = mixId(0x452821e638d01377ull, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(at.file_name())));
     return mixId(h, (static_cast<std::uint64_t>(at.line()) << 32) | at.column());
 }
-inline std::uint64_t& callScope() {
-    thread_local std::uint64_t scope = 0x6a09e667f3bcc909ull;
+
+// The component calls in progress, as a chain: chain * base + call, for each call, and
+// how many. Kept this way, the calls of one chain below another can be taken out exactly
+// (callsBetween), so an element's identity counts only the component calls between its
+// parent element and itself, and a component keeps its insides wherever it is called.
+struct CallScope {
+    std::uint64_t chain = 0;
+    std::uint32_t depth = 0;
+};
+inline constexpr std::uint64_t kChainBase = 0x9e3779b97f4a7c15ull;  // odd, so it can be divided out
+inline CallScope& callScope() {
+    thread_local CallScope scope;
     return scope;
 }
-inline std::uint64_t siteId(const std::source_location& at) { return mixSite(callScope(), at); }
 
-// Elements made while one is alive belong to that component call site.
+// Where an element was made: its tag's call site, inside these component calls.
+struct Site {
+    std::uint64_t at = 0;
+    CallScope scope;
+};
+inline Site siteOf(const std::source_location& at) { return {siteHash(at), callScope()}; }
+
+// The calls in `inner` below `outer`: for an element made in its parent's arguments, the
+// component calls between the two. An element made elsewhere and passed in (a node given to
+// a component) gets a number of its own, the same on every render.
+inline std::uint64_t callsBetween(const CallScope& outer, const CallScope& inner) {
+    std::uint64_t power = 1;
+    if (inner.depth >= outer.depth) {
+        for (std::uint32_t i = outer.depth; i < inner.depth; ++i) power *= kChainBase;
+        return mixId(inner.depth - outer.depth, inner.chain - outer.chain * power);
+    }
+    for (std::uint32_t i = inner.depth; i < outer.depth; ++i) power *= kChainBase;
+    return mixId(0x8000000000000000ull | (outer.depth - inner.depth), inner.chain * power - outer.chain);
+}
+
+// Elements made while one is alive are made inside that component call.
 class ComponentScope {
 public:
-    explicit ComponentScope(const std::source_location& at) : outer_(callScope()) { callScope() = mixSite(outer_, at); }
+    explicit ComponentScope(const std::source_location& at) : outer_(callScope()) {
+        callScope() = {outer_.chain * kChainBase + siteHash(at), outer_.depth + 1};
+    }
     ~ComponentScope() { callScope() = outer_; }
     ComponentScope(const ComponentScope&) = delete;
     ComponentScope& operator=(const ComponentScope&) = delete;
 
 private:
-    std::uint64_t outer_;
+    CallScope outer_;
 };
 
 }  // namespace detail
@@ -1246,7 +1277,7 @@ private:
     std::vector<detail::Prop> props_;
     std::vector<VirtualNode> children_;
     // Who it is: where it was made, its attr::Key, its position in a range of children.
-    std::uint64_t site_ = 0;
+    detail::Site site_;
     std::optional<std::string> key_;
     std::size_t item_ = kNoItem;
     // Set by the renderer: its identity on the page, and the number of its DOM node.
@@ -1287,7 +1318,7 @@ struct Children {
         node.name_ = std::move(text);
         return node;
     }
-    static VirtualNode element(std::string_view name, std::uint64_t site, std::vector<Prop> props) {
+    static VirtualNode element(std::string_view name, Site site, std::vector<Prop> props) {
         VirtualNode node;
         node.kind_ = VirtualNode::Kind::Element;
         node.name_ = std::string(name);
@@ -1353,7 +1384,7 @@ namespace detail {
 class FirstChild {
 public:
     template <Child T>
-    FirstChild(T&& child, std::source_location at = std::source_location::current()) : site_(siteId(at)) {
+    FirstChild(T&& child, std::source_location at = std::source_location::current()) : site_(siteOf(at)) {
         Children::append(nodes_, std::forward<T>(child));
     }
     FirstChild(const FirstChild&) = delete;
@@ -1363,7 +1394,7 @@ public:
 
 private:
     friend class volt2::Tag;
-    std::uint64_t site_;
+    Site site_;
     std::vector<VirtualNode> nodes_;
 };
 
@@ -1371,7 +1402,7 @@ class FirstProp {
 public:
     template <PropLike T>
     FirstProp(T&& prop, std::source_location at = std::source_location::current())
-        : site_(siteId(at)), prop_(std::forward<T>(prop)) {}
+        : site_(siteOf(at)), prop_(std::forward<T>(prop)) {}
     FirstProp(const FirstProp&) = delete;
     FirstProp(FirstProp&&) = delete;
     FirstProp& operator=(const FirstProp&) = delete;
@@ -1379,7 +1410,7 @@ public:
 
 private:
     friend class volt2::Tag;
-    std::uint64_t site_;
+    Site site_;
     Prop prop_;
 };
 
@@ -1409,11 +1440,11 @@ public:
 
 private:
     friend class Tag;
-    Element(std::string_view name, std::uint64_t site, std::vector<detail::Prop> props)
+    Element(std::string_view name, detail::Site site, std::vector<detail::Prop> props)
         : name_(name), site_(site), props_(std::move(props)) {}
 
     std::string_view name_;
-    std::uint64_t site_;
+    detail::Site site_;
     std::vector<detail::Prop> props_;
 };
 
@@ -1425,7 +1456,7 @@ public:
     constexpr explicit Tag(std::string_view name) : name_(name) {}
 
     Element operator[](std::source_location at = std::source_location::current()) const {
-        return Element(name_, detail::siteId(at), {});
+        return Element(name_, detail::siteOf(at), {});
     }
     template <PropLike... P>
     Element operator[](detail::FirstProp first, P&&... rest) const {
@@ -1440,7 +1471,7 @@ public:
     }
 
     VirtualNode operator()(std::source_location at = std::source_location::current()) const {
-        return detail::Children::element(name_, detail::siteId(at), {});
+        return detail::Children::element(name_, detail::siteOf(at), {});
     }
     template <Child... C>
     VirtualNode operator()(detail::FirstChild first, C&&... rest) const {
@@ -1682,9 +1713,10 @@ inline BasicAttribute<std::string, Booleans::TrueFalse> Aria(std::string_view ke
     return BasicAttribute<std::string, Booleans::TrueFalse>("aria-" + std::string(key));
 }
 
-// Not an HTML attribute: tells apart elements made by the same line of code, such as the
-// items of a list, so they keep their DOM nodes when the list reorders. A string or an
-// integer, unique among its siblings: attr::Key = fruit.id.
+// Not an HTML attribute: says which element this is among its siblings, whichever line of
+// code made it, so the items of a list keep their DOM nodes when the list reorders, and a
+// new key starts an element over. A string or an integer, unique among its siblings:
+// attr::Key = fruit.id.
 class KeyName {
 public:
     detail::Prop operator=(std::string_view value) const { return {detail::Prop::Kind::Key, "key", std::string(value), {}}; }
@@ -1816,6 +1848,7 @@ private:
     using Attributes = std::vector<std::pair<std::string_view, std::string_view>>;
     static constexpr std::uint64_t kRootPath = 0x243f6a8885a308d3ull;
     static constexpr std::uint64_t kIdPath = 0x13198a2e03707344ull;
+    static constexpr std::uint64_t kKeyed = 0xa4093822299f31d0ull;
     static constexpr std::uint64_t kMount = 0;  // the number of #volt2, which holds the page
 
     // One message per render, and none when nothing changed:
@@ -1835,6 +1868,7 @@ private:
             bool& flag;
             ~Done() { flag = false; }
         } done{rendering_};
+        const CallScope base = callScope();  // the calls around site(): none
         Nodes next;
         if (VirtualNode root = render_(); !root.isNothing()) next.push_back(std::move(root));
 
@@ -1849,7 +1883,7 @@ private:
         claimed_.clear();
 
         Json warnings = Json::array();
-        assignPaths(shown_, kRootPath, warnings);
+        assignPaths(shown_, kRootPath, base, warnings);
         Json steps = Json::array();
         diffChildren(kMount, reset ? nullptr : &previous, shown_, steps);
         old_.clear();
@@ -1872,28 +1906,30 @@ private:
         fresh_ = false;
     }
 
-    void assignPaths(Nodes& nodes, std::uint64_t parent, Json& warnings) {
+    // Each element's path: its parent's path and its own place under that parent, which is
+    // its key if it has one, or else where it was made (its call site and the component
+    // calls between its parent and it) and its position in a range. An id starts a path of
+    // its own.
+    void assignPaths(Nodes& nodes, std::uint64_t parent, const CallScope& scope, Json& warnings) {
         for (VirtualNode& node : nodes) {
             if (node.kind_ != VirtualNode::Kind::Element) continue;
             const std::string* id = attribute(node, "id");
             std::uint64_t path;
             if (id) {
                 path = mixId(kIdPath, hashText(*id));
+            } else if (node.key_) {
+                path = mixId(parent, mixId(kKeyed, hashText(*node.key_)));
             } else {
-                std::uint64_t own = node.site_;
-                if (node.key_) {
-                    own = mixId(mixId(own, 1), hashText(*node.key_));
-                } else if (node.item_ != VirtualNode::kNoItem) {
-                    own = mixId(mixId(own, 2), node.item_);
-                }
+                std::uint64_t own = mixId(callsBetween(scope, node.site_.scope), node.site_.at);
+                if (node.item_ != VirtualNode::kNoItem) own = mixId(mixId(own, 2), node.item_);
                 path = mixId(parent, own);
             }
             if (!byPath_.try_emplace(path, &node).second) {
                 if (id) {
                     warn(warnings, "two elements have id=\"" + *id + "\"; an id must be unique on the page");
                 } else if (node.key_) {
-                    warn(warnings, "two elements in the same list have attr::Key = \"" + *node.key_ +
-                                       "\"; keys must be unique among their siblings");
+                    warn(warnings, "two elements under the same parent have attr::Key = \"" + *node.key_ +
+                                       "\"; a key must be unique among its siblings");
                 }
                 // Otherwise the same code made both, such as a helper function called twice that is
                 // not a volt2::Component: they are told apart by their order.
@@ -1902,7 +1938,7 @@ private:
                 }
             }
             node.path_ = path;
-            assignPaths(node.children_, path, warnings);
+            assignPaths(node.children_, path, node.site_.scope, warnings);
         }
     }
 
@@ -2377,9 +2413,19 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
     const active = document.activeElement;
     const selection = selectionOf(active);
     const live = [];
+    const selects = new Set();
     patching = true;
     try {
-      for (const step of message.p) run(step, live);
+      for (const step of message.p) {
+        const select = selectAround(run(step, live));
+        if (select) selects.add(select);
+      }
+      // A select shows the option that matches its value, which can be another option once
+      // its options change: its value is applied again.
+      for (const select of selects) {
+        const value = select.getAttribute('value');
+        if (value !== null) live.push([select, 'value', value]);
+      }
       for (const change of live) setLive(change[0], change[1], change[2]);
       for (const number of message.x) forget(number);
       // A move loses the focus; arrange avoids moving the focused element, but if it had
@@ -2425,6 +2471,16 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
       default:
         throw new Error('volt2: unknown patch step ' + step[0]);
     }
+    return node;
+  }
+
+  // The select a changed node belongs to: the select itself, or one of its options.
+  function selectAround(node) {
+    for (let element = node.nodeType === 1 ? node : node.parentNode; element && element.nodeType === 1; element = element.parentNode) {
+      if (element.tagName === 'SELECT') return element;
+      if (element.tagName !== 'OPTION' && element.tagName !== 'OPTGROUP') return null;
+    }
+    return null;
   }
 
   // An existing node by number, or a new one with its children.
@@ -2526,7 +2582,8 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
   // What a form control shows is a property, which typing and clicking change; its
   // attribute is only the starting value. So these are set as properties too, once the
   // patch's elements are in place (a select needs its options first). An unchanged value
-  // is left alone, which keeps the caret where it is.
+)VOLT2JS",
+R"VOLT2JS(  // is left alone, which keeps the caret where it is.
   function setLive(element, name, value) {
     const tag = element.tagName;
     try {
@@ -2549,8 +2606,7 @@ R"VOLT2JS(// volt2 page client. The same file serves both builds:
     for (const type of types) {
       if (listening.has(type)) continue;
       listening.add(type);
-)VOLT2JS",
-R"VOLT2JS(      mount.addEventListener(type, deliver, true);
+      mount.addEventListener(type, deliver, true);
     }
   }
 
