@@ -1,6 +1,6 @@
-// Browser test for tests/markup, for either build.
+// Browser test for demos/markup.cpp, for either build.
 //   node tests/markup.test.cjs http://127.0.0.1:8080/
-const { chromium } = require('playwright');
+const { chromium } = require('./browser.cjs');
 
 const url = process.argv[2];
 let failures = 0;

@@ -1,6 +1,7 @@
-// Test program for lifetimes: js::Function ownership, one handle per page object,
-// Value as a map key, the thread check, stats and the development leak warning.
-// Driven by tests/lifetime.test.cjs through the functions it puts on window.
+// The lifetime demo: js::Function ownership, one handle per page object, Value as a map key,
+// the thread check, stats and the development leak warning. tests/lifetime.test.cjs drives it
+// through the functions this session puts on window; the page lists each one, what it checks,
+// and how to run it by hand in the browser console.
 #include "volt2.hpp"
 
 #include <cmath>
@@ -16,9 +17,95 @@ using volt2::js::Value;
 
 namespace {
 
+// The look shared by the demos: Pico CSS, the Inter font, and a few rules of our own.
+const std::vector<volt2::head::Item> kLook = {
+    volt2::head::Pico,
+    volt2::head::GoogleFont("Inter:wght@400;600;700"),
+    volt2::head::Css(R"(
+        :root { --pico-font-family: Inter, system-ui, sans-serif; }
+        main.container { max-width: 52rem; padding-block: 2rem; }
+        .about { margin-bottom: 0.4rem; font-size: 0.92rem; }
+        .about strong { color: var(--pico-primary); }
+        article header code { font-size: 1rem; }
+    )"),
+};
+
+// Adds an element with optional text to `parent`, and returns it.
+Value add(const Value& parent, const char* tag, const std::string& text) {
+    Value element = parent["ownerDocument"].call("createElement", tag);
+    if (!text.empty()) element.set("textContent", text);
+    parent.call("appendChild", element);
+    return element;
+}
+
+// One card per check: its console call, what it checks, how to run it, what should happen.
+void card(const Value& page, const std::string& call, const std::string& checks, const std::string& tryIt,
+          const std::string& expect) {
+    Value article = add(page, "article", "");
+    add(add(article, "header", ""), "code", call);
+    for (auto [label, text] : {std::pair{"Checks: ", checks}, std::pair{"Try it: ", tryIt}, std::pair{"Expect: ", expect}}) {
+        Value p = add(article, "p", "");
+        p.set("className", "about");
+        add(p, "strong", label);
+        p.call("append", text);
+    }
+}
+
+// The page: built once, in the constructor, by hand.
+void describe(const Value& document) {
+    document.set("title", "volt2 lifetime");
+    Value page = add(document["body"], "main", "");
+    page.set("className", "container");
+    Value header = add(page, "header", "");
+    add(header, "h1", "Lifetimes");
+    add(header, "p",
+        "How long JavaScript objects and C++ functions live when C++ holds them. Each check is a C++ function "
+        "this page puts on window: open the browser console (F12) and call them. cppStats() shows how many page "
+        "objects (values) and C++ functions C++ holds right now; most checks are about it returning to where it was.");
+    card(page, "cppStats()", "volt2::stats(): the page objects and C++ functions C++ holds.", "cppStats()",
+         "{values: ..., functions: ...}: small numbers, the same each time nothing happens in between.");
+    card(page, "churn(100)",
+         "100 buttons, each with a C++ click listener that captures its button, created and removed. Each "
+         "listener's js::Function is released at the end of its loop iteration, and the button with it.",
+         "cppStats(), then churn(100) a few times, then cppStats() again.", "the same numbers before and after.");
+    card(page, "holdTwice()",
+         "the same page object (document.body) fetched twice is one handle, and two Values for it compare equal in "
+         "C++ without asking the page.",
+         "holdTwice()", "{same: true, equal: true, added: 1}.");
+    card(page, "keyed()",
+         "Value as a std::unordered_map key: objects by identity, NaN equal to NaN, as JavaScript's Map does.",
+         "keyed()", "true.");
+    card(page, "releasedFunction()",
+         "a js::Function works while C++ holds it; once released, calling it from JavaScript throws, and leaks "
+         "nothing even when given objects.",
+         "releasedFunction(), then temporary()", "\"still here\", then an Error saying the function was released.");
+    card(page, "holdMany(250) and dropAll()",
+         "holding many page objects and functions: while developing, volt2 warns in both consoles once C++ holds "
+         "more than VOLT2_WARN_AT (default 10,000; the tests use 200), then each time the count doubles.",
+         "holdMany(250), cppStats(), dropAll(), cppStats(). Run the program with VOLT2_WARN_AT=200 to see the warning.",
+         "250 more of each, then back to the numbers before; with the low threshold, warnings \"C++ now holds ...\".");
+    card(page, "rvalueArguments()",
+         "temporaries passed straight into call() and set() stay alive until the page has used them.", "rvalueArguments()",
+         "\"SPAN\".");
+    card(page, "freshAfterGrowth(900)",
+         "an object returned by a C++ function reaches the page even when a leak warning is sent in the same call.",
+         "freshAfterGrowth(900).tagName, then dropAll()", "\"B\".");
+    card(page, "fromThread()",
+         "Values and stats() belong to the thread that called volt2::run: another thread gets an error; a Value "
+         "destroyed on another thread is still released.",
+         "fromThread()",
+         "two \"only be used on the thread that called volt2::run\" messages (WebAssembly: \"no threads in this build\").");
+    card(page, "dropFunctionOnThread() and droppedOnThread()",
+         "a js::Function destroyed on another thread, with what its lambda points at: JavaScript must be told it was "
+         "released, never call into freed memory.",
+         "dropFunctionOnThread(), then droppedOnThread()", "true, then an Error saying the function was released.");
+}
+
 class LifetimePage : public volt2::Session {
 public:
     LifetimePage() {
+        describe(document);
+
         expose(stats, "cppStats", [] {
             volt2::Stats now = volt2::stats();  // before creating the result object
             Value result = Value::object();
@@ -162,4 +249,4 @@ private:
 
 }  // namespace
 
-int main() { return volt2::run<LifetimePage>(); }
+int main() { return volt2::run<LifetimePage>({.head = kLook}); }
