@@ -1,0 +1,88 @@
+# Runs tests/run.sh on every pull request and every push to main: one job per toolchain, in
+# parallel, so each shows as its own check on the pull request.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:  # a newer push to the same branch cancels the run still going
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: ${{ matrix.toolchain }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolchain: gcc
+            run: checks gcc  # the compile-time checks and the benchmark ride along
+          - toolchain: clang
+          - toolchain: tsan
+          - toolchain: asan
+          - toolchain: wasm
+          - toolchain: mingw
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Install Playwright and Chromium
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+      - name: Let the sanitizers map their memory  # needed on recent kernels
+        if: matrix.toolchain == 'tsan' || matrix.toolchain == 'asan'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Install Emscripten
+        if: matrix.toolchain == 'wasm'
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.13
+      - name: Install MinGW and Wine
+        if: matrix.toolchain == 'mingw'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++-mingw-w64-x86-64-posix wine64 wine
+      - name: Test
+        run: tests/run.sh ${{ matrix.run || matrix.toolchain }}
+      - name: Keep the logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.toolchain }}
+          path: build/tests/*.log
+
+  msvc:
+    name: msvc
+    runs-on: windows-2025  # Windows Server 2025 with Visual Studio 2026
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Install Playwright and Chromium
+        run: |
+          npm install
+          npx playwright install chromium
+      - name: Set up the Visual Studio developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Test
+        shell: bash
+        run: tests/run.sh msvc
+      - name: Keep the logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-msvc
+          path: build/tests/*.log
