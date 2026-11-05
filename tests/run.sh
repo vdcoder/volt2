@@ -186,11 +186,11 @@ if wanted checks; then
     awk '/^```cpp$/{n++; if (n == 1) {f = 1; next}} f && /^```$/{exit} f' README.md > "$OUT/readme.cpp"
     build readme g++ "${FLAGS[@]}" -fsyntax-only "$OUT/readme.cpp" && echo "  ok"
 
-    # On CI, where the network is open: the CDN files that volt2::head's presets name exist.
+    # On CI, where the network is open: the stylesheets the demos load exist.
     if [ -n "${CI:-}" ]; then
-        step "the stylesheets and scripts of volt2::head's presets exist"
-        for url in $(grep -o 'https://cdn\.jsdelivr\.net/[^"]*' volt2.hpp); do
-            if curl -sfIL --max-time 30 -o /dev/null "$url"; then echo "  ok: $url"; else fail "missing: $url"; fi
+        step "the stylesheets the demos load exist"
+        for url in $(grep -oh 'Stylesheet("https://[^"]*' demos/*.cpp | cut -d'"' -f2 | sort -u); do
+            if curl -sfL --max-time 30 -o /dev/null "$url"; then echo "  ok: $url"; else fail "missing: $url"; fi
         done
     fi
 

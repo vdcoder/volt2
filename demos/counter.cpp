@@ -14,10 +14,11 @@
 using namespace volt2;
 
 // The look: Pico CSS styles plain HTML (headings, buttons, inputs, cards), Inter is the font,
-// and a few rules of our own. head:: items go into every page's <head>, see run() below.
+// and a few rules of our own. head:: items go into every page's <head>, see run() below; any
+// stylesheet, script or CSS works, volt2 only puts them there.
 const std::vector<head::Item> kLook = {
-    head::Pico,
-    head::GoogleFont("Inter:wght@400;600;700"),
+    head::Stylesheet("https://cdn.jsdelivr.net/npm/@picocss/pico@2.1.1/css/pico.min.css"),  // Pico CSS (picocss.com)
+    head::Stylesheet("https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap"),  // the Inter font
     head::Css(R"(
         :root { --pico-font-family: Inter, system-ui, sans-serif; }
         main.container { max-width: 52rem; padding-block: 2rem; }

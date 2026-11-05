@@ -586,15 +586,15 @@ concept SessionType = std::derived_from<S, Session> && std::default_initializabl
 
 using js::Value;
 
-// What every page of the site loads in its <head>: stylesheets, fonts, CSS of your own and
-// scripts, given to run:
+// What every page of the site loads in its <head>: stylesheets, CSS of your own and scripts,
+// given to run:
 //
-//     volt2::run(site, {.head = {volt2::head::Pico, volt2::head::GoogleFont("Inter:wght@400;600"),
-//                                volt2::head::Css("body { font-family: Inter, sans-serif; }")}});
+//     volt2::run(site, {.head = {volt2::head::Stylesheet("https://example.com/style.css"),
+//                                volt2::head::Css("body { font-family: sans-serif; }")}});
 //
 // While developing they are written into the page's <head>, so the first render is already
 // styled. In WebAssembly they are added when the site starts, and the page stays hidden until
-// the stylesheets have loaded (3 seconds at most).
+// the stylesheets and scripts have loaded (3 seconds at most).
 namespace head {
 struct Item {
     enum class Kind { Stylesheet, Css, Script };
@@ -604,33 +604,9 @@ struct Item {
 inline Item Stylesheet(std::string url) { return {Item::Kind::Stylesheet, std::move(url)}; }
 inline Item Css(std::string css) { return {Item::Kind::Css, std::move(css)}; }
 inline Item Script(std::string url) { return {Item::Kind::Script, std::move(url)}; }
-
-// A Google Fonts family, written the way Google Fonts writes it: "Inter",
-// "Inter:wght@400;700", "Roboto Mono". Then use it in your CSS: font-family: Inter, sans-serif.
-inline Item GoogleFont(std::string_view family) {
-    std::string name(family);
-    for (char& c : name) {
-        if (c == ' ') c = '+';
-    }
-    return Stylesheet("https://fonts.googleapis.com/css2?family=" + name + "&display=swap");
-}
-
-// CSS libraries that make plain HTML look good, pinned, from the jsDelivr CDN.
-// Pico (picocss.com): styles semantic HTML (header, article, button, input...), light and
-// dark; its classes (container, grid, secondary, outline...) are optional.
-inline const Item Pico = Stylesheet("https://cdn.jsdelivr.net/npm/@picocss/pico@2.1.1/css/pico.min.css");
-inline const Item PicoClassless =
-    Stylesheet("https://cdn.jsdelivr.net/npm/@picocss/pico@2.1.1/css/pico.classless.min.css");
-// Water.css (watercss.kognise.dev): no classes at all, light and dark.
-inline const Item WaterCss = Stylesheet("https://cdn.jsdelivr.net/npm/water.css@2.1.1/out/water.min.css");
-// Chota (jenil.github.io/chota): tiny, with a grid and utility classes.
-inline const Item Chota = Stylesheet("https://cdn.jsdelivr.net/npm/chota@0.9.2/dist/chota.min.css");
-// Tailwind CSS, compiled in the browser as the page changes: good for trying things out;
-// Tailwind's authors advise building the CSS ahead of time for a real site.
-inline const Item TailwindBrowser = Script("https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.3.4");
 }  // namespace head
 
-// For example: volt2::run(site, {.port = 8123, .openBrowser = false, .head = {volt2::head::Pico}});
+// For example: volt2::run(site, {.port = 8123, .openBrowser = false});
 struct Options {
     int port = 0;             // 0: VOLT2_PORT, else the first free port from 8080
     bool openBrowser = true;  // development only; VOLT2_NO_BROWSER=1 also disables it
