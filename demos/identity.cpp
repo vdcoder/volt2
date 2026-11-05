@@ -11,10 +11,11 @@
 
 using namespace volt2;
 
-// The look shared by the demos: Pico CSS, the Inter font, and a few rules of our own.
+// The look shared by the demos: Pico CSS (it styles plain HTML), the Inter font from Google Fonts,
+// and a few rules of our own. Any URLs work: volt2 only puts them in the page's <head>.
 const std::vector<head::Item> kLook = {
-    head::Pico,
-    head::GoogleFont("Inter:wght@400;600;700"),
+    head::Stylesheet("https://cdn.jsdelivr.net/npm/@picocss/pico@2.1.1/css/pico.min.css"),  // Pico CSS (picocss.com)
+    head::Stylesheet("https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap"),  // the Inter font
     head::Css(R"(
         :root { --pico-font-family: Inter, system-ui, sans-serif; }
         main.container { max-width: 52rem; padding-block: 2rem; }

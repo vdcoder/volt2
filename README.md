@@ -84,40 +84,36 @@ Build any of them like the counter, for example `g++ -std=c++23 -I. demos/identi
 | [`locals`](demos/locals.cpp) | state inside components with `volt2::local` |
 
 They all use the same look: [Pico CSS](https://picocss.com), the Inter font, and a few rules of
-their own, through the `head` option described next.
+their own, loaded with the `head` option described next.
 
 ## Styling
 
-`run` takes what every page should load in its `<head>`: stylesheets, fonts, CSS of your own and
-scripts.
+`run` takes what every page should load in its `<head>`: stylesheets, CSS of your own and scripts.
+Any CSS library or font works; volt2 only puts them in the page.
 
 ```cpp
 int main() {
     return volt2::run(site, {.head = {
-        volt2::head::Pico,                               // a CSS library
-        volt2::head::GoogleFont("Inter:wght@400;600"),   // a font from Google Fonts
+        volt2::head::Stylesheet("https://cdn.jsdelivr.net/npm/@picocss/pico@2.1.1/css/pico.min.css"),
+        volt2::head::Stylesheet("https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap"),
         volt2::head::Css(R"(
             :root { --pico-font-family: Inter, sans-serif; }
             .note { color: gray; }
-        )"),                                             // CSS of your own, for the whole site
+        )"),  // CSS of your own, for the whole site
     }});
 }
 ```
 
-- **Libraries, ready to use** (pinned versions, from the jsDelivr CDN): `head::Pico` and
-  `head::PicoClassless` ([Pico CSS](https://picocss.com): styles plain HTML, light and dark),
-  `head::WaterCss` ([Water.css](https://watercss.kognise.dev): no classes at all), `head::Chota`
-  ([Chota](https://jenil.github.io/chota): tiny, with a grid and utility classes), and
-  `head::TailwindBrowser` ([Tailwind CSS](https://tailwindcss.com) compiled in the browser, for trying
-  things out; Tailwind advises building the CSS ahead of time for a real site).
-- **Anything else:** `head::Stylesheet(url)`, `head::Script(url)`, `head::Css(text)`, and
-  `head::GoogleFont(family)` with the family written as Google Fonts writes it, such as
-  `"Roboto Mono:wght@400;700"`.
-- **Per element:** `attr::Class = "..."` and `attr::Style = "..."` as usual.
+- `head::Stylesheet(url)`, `head::Css(text)` and `head::Script(url)`, in the order given.
+- Libraries that style plain HTML suit volt2's markup well, as the elements need no classes:
+  [Pico CSS](https://picocss.com) (used by the demos), [Water.css](https://watercss.kognise.dev),
+  [Chota](https://jenil.github.io/chota). Fonts come the same way, for example from
+  [Google Fonts](https://fonts.google.com).
+- Per element: `attr::Class = "..."` and `attr::Style = "..."` as usual.
 
 While developing, these are written into the page's `<head>`, so the first render is already
 styled. In WebAssembly they are added when the site starts, and the page stays hidden until the
-stylesheets have loaded (3 seconds at most).
+stylesheets and scripts have loaded (3 seconds at most).
 
 ## Sessions
 

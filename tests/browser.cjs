@@ -1,5 +1,5 @@
 // Chromium for the browser tests. Requests that would leave this machine (stylesheets, fonts
-// and scripts from CDNs, see volt2::head) get an empty answer, so the tests neither depend on
+// and scripts from CDNs, see the demos' head option) get an empty answer, so the tests neither depend on
 // the network nor wait for it. Use it like Playwright's: const { chromium } = require('./browser.cjs');
 const playwright = require('playwright');
 
