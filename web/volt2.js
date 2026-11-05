@@ -465,10 +465,48 @@
     return JSON.stringify(exec(JSON.parse(text)));
   }
 
+  // The stylesheets, CSS and scripts of volt2::run's head option, in the WebAssembly build
+  // (while developing, they are written into the page itself). The page stays hidden until
+  // the stylesheets and scripts have loaded, 3 seconds at most, so it is never seen unstyled.
+  function head(json) {
+    const waits = [];
+    for (const item of JSON.parse(json)) {
+      let element;
+      if (item[0] === 'stylesheet') {
+        element = document.createElement('link');
+        element.rel = 'stylesheet';
+        element.href = item[1];
+      } else if (item[0] === 'script') {
+        element = document.createElement('script');
+        element.src = item[1];
+        element.async = false; // in order
+      } else {
+        element = document.createElement('style');
+        element.textContent = item[1];
+      }
+      if (item[0] !== 'css') {
+        waits.push(new Promise(function (done) {
+          element.onload = element.onerror = done;
+        }));
+      }
+      document.head.appendChild(element);
+    }
+    if (!waits.length) return;
+    const root = document.documentElement;
+    root.style.visibility = 'hidden';
+    const timeout = new Promise(function (done) {
+      setTimeout(done, 3000);
+    });
+    Promise.race([Promise.all(waits), timeout]).then(function () {
+      root.style.visibility = '';
+    });
+  }
+
   const api = {
     mode: 'not started', // then 'development' or 'webassembly'
     startDev: startDev,
     attachWasm: attachWasm,
+    head: head,
     execJson: execJson,
     handleCount: function () {
       return handles.size;

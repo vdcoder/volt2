@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the example and the test programs and runs the browser tests against each build.
+# Builds the demos (demos/*.cpp) and runs their browser tests (tests/*.test.cjs) against each build.
 #
 #   tests/run.sh                  every toolchain this machine has
 #   tests/run.sh checks gcc       only these (CI runs one per job)
@@ -25,13 +25,13 @@ FLAGS=(-std=c++23 -Wall -Wextra -Wpedantic -Werror -g -I.)
 MSVC=(-nologo -std:c++23preview -EHsc -W4 -WX -permissive- -utf-8 -Zc:__cplusplus -I.)
 # name, source, tests on development builds, tests on WebAssembly builds
 PROGRAMS=(
-    "counter examples/counter/main.cpp counter counter"
-    "markup tests/markup/main.cpp markup markup"
-    "bridge tests/bridge/main.cpp bridge,reload bridge"
-    "lifetime tests/lifetime/main.cpp lifetime lifetime"
-    "identity tests/identity/main.cpp identity identity"
-    "diff tests/diff/main.cpp diff diff"
-    "locals tests/locals/main.cpp locals locals"
+    "counter demos/counter.cpp counter counter"
+    "markup demos/markup.cpp markup markup"
+    "bridge demos/bridge.cpp bridge,reload bridge"
+    "lifetime demos/lifetime.cpp lifetime lifetime"
+    "identity demos/identity.cpp identity identity"
+    "diff demos/diff.cpp diff diff"
+    "locals demos/locals.cpp locals locals"
 )
 port=8900
 failed=()
@@ -145,7 +145,7 @@ if wanted checks; then
     python3 tools/embed_js.py --check || fail "embed check"
 
     step "C++20 is refused with a clear message"
-    if g++ -std=c++20 -fsyntax-only -I. examples/counter/main.cpp 2> "$OUT/cxx20.log"; then
+    if g++ -std=c++20 -fsyntax-only -I. demos/counter.cpp 2> "$OUT/cxx20.log"; then
         fail "a C++20 build was accepted"
     elif grep -q 'volt2 needs C++23' "$OUT/cxx20.log"; then
         echo "  ok: $(grep -m1 -o 'volt2 needs C++23[^"]*' "$OUT/cxx20.log")"
@@ -185,6 +185,14 @@ if wanted checks; then
     step "the README's example compiles"
     awk '/^```cpp$/{n++; if (n == 1) {f = 1; next}} f && /^```$/{exit} f' README.md > "$OUT/readme.cpp"
     build readme g++ "${FLAGS[@]}" -fsyntax-only "$OUT/readme.cpp" && echo "  ok"
+
+    # On CI, where the network is open: the CDN files that volt2::head's presets name exist.
+    if [ -n "${CI:-}" ]; then
+        step "the stylesheets and scripts of volt2::head's presets exist"
+        for url in $(grep -o 'https://cdn\.jsdelivr\.net/[^"]*' volt2.hpp); do
+            if curl -sfIL --max-time 30 -o /dev/null "$url"; then echo "  ok: $url"; else fail "missing: $url"; fi
+        done
+    fi
 
     step "render speed (for information)"
     build bench g++ "${FLAGS[@]}" -O2 -pthread tests/bench/main.cpp -o "$OUT/bench" && { "$OUT/bench" || fail "bench"; }
@@ -283,7 +291,7 @@ msvc_refused() {  # name, code, message: must not compile, saying why
 if wanted msvc; then
     step "MSVC (Debug)"
     cl.exe 2>&1 | head -1
-    if cl.exe -nologo -std:c++20 -EHsc -Zs -I. examples/counter/main.cpp > "$OUT/msvc-cxx20.log" 2>&1; then
+    if cl.exe -nologo -std:c++20 -EHsc -Zs -I. demos/counter.cpp > "$OUT/msvc-cxx20.log" 2>&1; then
         fail "msvc: a C++20 build was accepted"
     elif grep -q 'volt2 needs C++23' "$OUT/msvc-cxx20.log"; then
         echo "  ok: C++20 is refused: $(grep -m1 -o 'volt2 needs C++23[^"]*' "$OUT/msvc-cxx20.log")"

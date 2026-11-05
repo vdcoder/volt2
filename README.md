@@ -26,8 +26,8 @@ int main() { return run(site); }
 - **To deploy,** compile the same file with Emscripten. The site becomes static files
   (`index.html`, `volt2.js`, `app.js`, `app.wasm`) for any web host. No server.
 
-See [`examples/counter`](examples/counter/main.cpp) for a counter, a greeting typed live, a panel
-that opens and closes, and a list.
+See [`demos/counter.cpp`](demos/counter.cpp) for a counter, a greeting typed live, a panel that
+opens and closes, and a list, and [the other demos](#demos) for everything else.
 
 ## Develop
 
@@ -41,7 +41,7 @@ stopped. (Set the standard on the project, not on `main.cpp` alone, so every fil
 **g++ / clang:**
 
 ```bash
-g++ -std=c++23 -I. examples/counter/main.cpp -o counter -pthread
+g++ -std=c++23 -I. demos/counter.cpp -o counter -pthread
 ./counter
 ```
 
@@ -65,6 +65,59 @@ cp web/index.html web/volt2.js site/
 
 Upload `site/` to any static host. `-fexceptions` and `-lembind` are required; volt2 tells you
 at compile time if exceptions are off.
+
+## Demos
+
+Each demo in [`demos/`](demos) is one `.cpp` file, a complete site. Every part of its page says what
+it checks, how to try it by hand, and what should happen; a browser test in `tests/` drives it.
+Build any of them like the counter, for example `g++ -std=c++23 -I. demos/identity.cpp -o identity -pthread`
+(in Visual Studio, add the file to a C++23 console project).
+
+| Demo | What it shows |
+|---|---|
+| [`counter`](demos/counter.cpp) | the starter: state, events, typing live, a panel, a keyed list |
+| [`markup`](demos/markup.cpp) | attributes, text, bubbling, `preventDefault`, event values, children, `None`, sessions |
+| [`bridge`](demos/bridge.cpp) | a page built by hand with `js::Value`: calls in both directions, nested calls, errors |
+| [`lifetime`](demos/lifetime.cpp) | how long page objects and C++ functions live; checks run from the browser console |
+| [`identity`](demos/identity.cpp) | how renders keep elements, focus and typed text: keys, components, lists, form controls |
+| [`diff`](demos/diff.cpp) | random changes; after each, the page must be exactly the tree C++ rendered |
+| [`locals`](demos/locals.cpp) | state inside components with `volt2::local` |
+
+They all use the same look: [Pico CSS](https://picocss.com), the Inter font, and a few rules of
+their own, through the `head` option described next.
+
+## Styling
+
+`run` takes what every page should load in its `<head>`: stylesheets, fonts, CSS of your own and
+scripts.
+
+```cpp
+int main() {
+    return volt2::run(site, {.head = {
+        volt2::head::Pico,                               // a CSS library
+        volt2::head::GoogleFont("Inter:wght@400;600"),   // a font from Google Fonts
+        volt2::head::Css(R"(
+            :root { --pico-font-family: Inter, sans-serif; }
+            .note { color: gray; }
+        )"),                                             // CSS of your own, for the whole site
+    }});
+}
+```
+
+- **Libraries, ready to use** (pinned versions, from the jsDelivr CDN): `head::Pico` and
+  `head::PicoClassless` ([Pico CSS](https://picocss.com): styles plain HTML, light and dark),
+  `head::WaterCss` ([Water.css](https://watercss.kognise.dev): no classes at all), `head::Chota`
+  ([Chota](https://jenil.github.io/chota): tiny, with a grid and utility classes), and
+  `head::TailwindBrowser` ([Tailwind CSS](https://tailwindcss.com) compiled in the browser, for trying
+  things out; Tailwind advises building the CSS ahead of time for a real site).
+- **Anything else:** `head::Stylesheet(url)`, `head::Script(url)`, `head::Css(text)`, and
+  `head::GoogleFont(family)` with the family written as Google Fonts writes it, such as
+  `"Roboto Mono:wght@400;700"`.
+- **Per element:** `attr::Class = "..."` and `attr::Style = "..."` as usual.
+
+While developing, these are written into the page's `<head>`, so the first render is already
+styled. In WebAssembly they are added when the site starts, and the page stays hidden until the
+stylesheets have loaded (3 seconds at most).
 
 ## Sessions
 
@@ -286,18 +339,9 @@ the target upward, in one call; C++ runs their handlers and renders once.
 
 ## Tests
 
-`tests/run.sh` builds seven programs every way the machine supports and runs their browser tests
-against each build:
-
-| Program | Browser tests |
-|---|---|
-| `examples/counter` | `counter`: rendering, events, conditionals, lists |
-| `tests/markup` | `markup`: attributes, text, bubbling, `preventDefault`, event values, sessions |
-| `tests/bridge` | `bridge`, `reload`: calls in both directions, errors, page reloads and tabs |
-| `tests/lifetime` | `lifetime`: functions, object identity, threads, leak warnings |
-| `tests/identity` | `identity`: typing, keys, ids, components, focus, form controls, minimal updates |
-| `tests/diff` | `diff`: 400 random changes; after each, the page must be exactly the rendered tree |
-| `tests/locals` | `locals`: state per component call, keyed and unkeyed lists, when state is kept or dropped |
+`tests/run.sh` builds the seven [demos](#demos) every way the machine supports and runs their browser
+tests (`tests/<demo>.test.cjs`, plus `reload` for `bridge`) against each build. The tests answer the
+pages' requests to CDNs with empty files, so they neither need nor wait for the network.
 
 The builds are g++, clang, ThreadSanitizer, AddressSanitizer with UndefinedBehaviorSanitizer,
 WebAssembly (with Emscripten activated), the Windows build via MinGW and Wine, and MSVC. It also

@@ -586,10 +586,55 @@ concept SessionType = std::derived_from<S, Session> && std::default_initializabl
 
 using js::Value;
 
-// For example: volt2::run(site, {.port = 8123, .openBrowser = false});
+// What every page of the site loads in its <head>: stylesheets, fonts, CSS of your own and
+// scripts, given to run:
+//
+//     volt2::run(site, {.head = {volt2::head::Pico, volt2::head::GoogleFont("Inter:wght@400;600"),
+//                                volt2::head::Css("body { font-family: Inter, sans-serif; }")}});
+//
+// While developing they are written into the page's <head>, so the first render is already
+// styled. In WebAssembly they are added when the site starts, and the page stays hidden until
+// the stylesheets have loaded (3 seconds at most).
+namespace head {
+struct Item {
+    enum class Kind { Stylesheet, Css, Script };
+    Kind kind;
+    std::string text;  // the URL, or the CSS itself
+};
+inline Item Stylesheet(std::string url) { return {Item::Kind::Stylesheet, std::move(url)}; }
+inline Item Css(std::string css) { return {Item::Kind::Css, std::move(css)}; }
+inline Item Script(std::string url) { return {Item::Kind::Script, std::move(url)}; }
+
+// A Google Fonts family, written the way Google Fonts writes it: "Inter",
+// "Inter:wght@400;700", "Roboto Mono". Then use it in your CSS: font-family: Inter, sans-serif.
+inline Item GoogleFont(std::string_view family) {
+    std::string name(family);
+    for (char& c : name) {
+        if (c == ' ') c = '+';
+    }
+    return Stylesheet("https://fonts.googleapis.com/css2?family=" + name + "&display=swap");
+}
+
+// CSS libraries that make plain HTML look good, pinned, from the jsDelivr CDN.
+// Pico (picocss.com): styles semantic HTML (header, article, button, input...), light and
+// dark; its classes (container, grid, secondary, outline...) are optional.
+inline const Item Pico = Stylesheet("https://cdn.jsdelivr.net/npm/@picocss/pico@2.1.1/css/pico.min.css");
+inline const Item PicoClassless =
+    Stylesheet("https://cdn.jsdelivr.net/npm/@picocss/pico@2.1.1/css/pico.classless.min.css");
+// Water.css (watercss.kognise.dev): no classes at all, light and dark.
+inline const Item WaterCss = Stylesheet("https://cdn.jsdelivr.net/npm/water.css@2.1.1/out/water.min.css");
+// Chota (jenil.github.io/chota): tiny, with a grid and utility classes.
+inline const Item Chota = Stylesheet("https://cdn.jsdelivr.net/npm/chota@0.9.2/dist/chota.min.css");
+// Tailwind CSS, compiled in the browser as the page changes: good for trying things out;
+// Tailwind's authors advise building the CSS ahead of time for a real site.
+inline const Item TailwindBrowser = Script("https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.3.4");
+}  // namespace head
+
+// For example: volt2::run(site, {.port = 8123, .openBrowser = false, .head = {volt2::head::Pico}});
 struct Options {
     int port = 0;             // 0: VOLT2_PORT, else the first free port from 8080
     bool openBrowser = true;  // development only; VOLT2_NO_BROWSER=1 also disables it
+    std::vector<head::Item> head;
 };
 
 namespace detail {
@@ -3201,10 +3246,48 @@ R"VOLT2JS(  // is left alone, which keeps the caret where it is.
     return JSON.stringify(exec(JSON.parse(text)));
   }
 
+  // The stylesheets, CSS and scripts of volt2::run's head option, in the WebAssembly build
+  // (while developing, they are written into the page itself). The page stays hidden until
+  // the stylesheets and scripts have loaded, 3 seconds at most, so it is never seen unstyled.
+  function head(json) {
+    const waits = [];
+    for (const item of JSON.parse(json)) {
+      let element;
+      if (item[0] === 'stylesheet') {
+        element = document.createElement('link');
+        element.rel = 'stylesheet';
+        element.href = item[1];
+      } else if (item[0] === 'script') {
+        element = document.createElement('script');
+        element.src = item[1];
+        element.async = false; // in order
+      } else {
+        element = document.createElement('style');
+        element.textContent = item[1];
+      }
+      if (item[0] !== 'css') {
+        waits.push(new Promise(function (done) {
+          element.onload = element.onerror = done;
+        }));
+      }
+      document.head.appendChild(element);
+    }
+    if (!waits.length) return;
+    const root = document.documentElement;
+    root.style.visibility = 'hidden';
+    const timeout = new Promise(function (done) {
+      setTimeout(done, 3000);
+    });
+    Promise.race([Promise.all(waits), timeout]).then(function () {
+      root.style.visibility = '';
+    });
+  }
+
   const api = {
     mode: 'not started', // then 'development' or 'webassembly'
     startDev: startDev,
     attachWasm: attachWasm,
+    head: head,
     execJson: execJson,
     handleCount: function () {
       return handles.size;
@@ -3396,13 +3479,51 @@ private:
     std::string page_;
 };
 
-inline const char* devPage() {
+// The <head> items of run's options, as HTML, written into the page served while developing.
+inline std::string& pageHead() {
+    static std::string html;
+    return html;
+}
+
+inline std::string headHtml(const std::vector<head::Item>& items) {
+    auto attribute = [](const std::string& text) {
+        std::string out;
+        for (char c : text) {
+            if (c == '&') out += "&amp;";
+            else if (c == '"') out += "&quot;";
+            else if (c == '<') out += "&lt;";
+            else out += c;
+        }
+        return out;
+    };
+    std::string html;
+    for (const head::Item& item : items) {
+        switch (item.kind) {
+            case head::Item::Kind::Stylesheet:
+                html += "<link rel=\"stylesheet\" href=\"" + attribute(item.text) + "\">\n";
+                break;
+            case head::Item::Kind::Script:
+                html += "<script src=\"" + attribute(item.text) + "\"></script>\n";
+                break;
+            case head::Item::Kind::Css: {
+                std::string css = item.text;  // it cannot end the <style> element early
+                for (std::size_t at = css.find("</"); at != std::string::npos; at = css.find("</", at + 3)) css.insert(at + 1, "\\");
+                html += "<style>\n" + css + "\n</style>\n";
+                break;
+            }
+        }
+    }
+    return html;
+}
+
+inline std::string devPage() {
     return "<!doctype html>\n"
            "<html>\n"
            "<head>\n"
            "<meta charset=\"utf-8\">\n"
            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-           "<title>volt2</title>\n"
+           "<title>volt2</title>\n" +
+           pageHead() +
            "</head>\n"
            "<body>\n"
            "<script src=\"/volt2/volt2.js\"></script>\n"
@@ -3586,6 +3707,7 @@ inline int detail::runSite(SiteDefinition site, Options options) {
         return 1;
     }
 
+    pageHead() = headHtml(options.head);  // before any connection thread reads it
     static Bridge bridge;  // outlives the detached connection threads
     runtime().transport = &bridge;
     runtime().thread = std::this_thread::get_id();
@@ -3632,7 +3754,7 @@ inline std::string wasmDispatch(std::string text) {
 }  // namespace detail
 
 // WebAssembly: starts the site once, then returns; the page keeps calling into the module.
-inline int detail::runSite(SiteDefinition site, Options) {
+inline int detail::runSite(SiteDefinition site, Options options) {
     runtime().thread = std::this_thread::get_id();
     static bool registered = false;
     if (!registered) {
@@ -3646,6 +3768,17 @@ inline int detail::runSite(SiteDefinition site, Options) {
     }
     static WasmTransport transport;
     runtime().transport = &transport;
+    if (!options.head.empty()) {  // stylesheets, CSS and scripts for <head>, before the first render
+        static const char* const kinds[] = {"stylesheet", "css", "script"};
+        Json items = Json::array();
+        for (const head::Item& item : options.head) {
+            Json entry = Json::array();
+            entry.push(Json::string(kinds[static_cast<int>(item.kind)]));
+            entry.push(Json::string(item.text));
+            items.push(std::move(entry));
+        }
+        client.call<void>("head", items.dump());
+    }
     client.call<void>("attachWasm", emscripten::val::module_property("volt2_dispatch"));
     beginPage();
     try {

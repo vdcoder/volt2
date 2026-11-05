@@ -1,7 +1,7 @@
-// Browser test for tests/lifetime, for either build.
+// Browser test for demos/lifetime.cpp, for either build.
 //   node tests/lifetime.test.cjs http://127.0.0.1:8080/
 // Start the development build with VOLT2_WARN_AT=200 so the leak warning can be checked.
-const { chromium } = require('playwright');
+const { chromium } = require('./browser.cjs');
 
 const url = process.argv[2];
 let failures = 0;

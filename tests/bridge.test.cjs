@@ -1,7 +1,7 @@
-// Browser test for tests/bridge, for either build.
+// Browser test for demos/bridge.cpp, for either build.
 //   node tests/bridge.test.cjs http://127.0.0.1:8080/
 // Needs Playwright (npm i playwright; npx playwright install chromium).
-const { chromium } = require('playwright');
+const { chromium } = require('./browser.cjs');
 
 const url = process.argv[2];
 if (!url) {
